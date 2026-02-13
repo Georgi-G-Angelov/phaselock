@@ -1,0 +1,85 @@
+You are implementing Step 15 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 13 and 14 are complete (Tauri IPC commands, global styles & layout).
+
+## Task: Frontend — Home Screen & Session Browser
+
+Implement the Home screen, Create Jam dialog, and Session Browser (Join Jam) screens with full Tauri backend integration.
+
+### What to do:
+
+1. **Implement the Home Screen** (`src/lib/components/HomeScreen.svelte`):
+
+   Layout (centered, vertically stacked):
+   - App logo / title: "🎵 PhaseLock" in large text.
+   - Subtitle: "Synchronized music playback" in secondary text.
+   - Two large buttons:
+     - **"Create Jam"** — green primary button. Dispatches `on:create` event to navigate to CreateJam screen.
+     - **"Join Jam"** — secondary button. Dispatches `on:join` event to navigate to SessionBrowser screen.
+   - Subtle footer: version number ("v0.1.0").
+
+2. **Implement the Create Jam screen** (`src/lib/components/CreateJam.svelte`):
+
+   Layout:
+   - Header: "Create a Jam" with a back arrow/button.
+   - Form fields:
+     - **Session name** — text input, placeholder "e.g., Friday Night Vibes", required.
+     - **Your name** — text input, placeholder "e.g., Alex", required.
+   - **"Create"** button (green, disabled until both fields are non-empty).
+   - On submit:
+     1. Call `invoke('create_session', { sessionName, displayName })`.
+     2. Show a loading spinner while waiting.
+     3. On success: set `isHost` store to true, populate `sessionStore`, navigate to host session screen via `dispatch('created')`.
+     4. On error: show an error toast (e.g., "Port already in use").
+
+3. **Implement the Session Browser** (`src/lib/components/SessionBrowser.svelte`):
+
+   Layout:
+   - Header: "Join a Jam" with a back arrow/button.
+   - **Your name** — text input at the top, placeholder "e.g., Alex", required.
+   - **Discovered sessions list:**
+     - Subscribe to the `discoveredSessions` store.
+     - On mount: call `invoke('get_discovered_sessions')` and also listen for `discovery:sessions-updated` events to keep the list live.
+     - Each session card shows:
+       - 🟢 dot + session name (bold)
+       - "hosted by {host_name} — {peer_count}/{max_peers} peers"
+     - Clicking a session card triggers join (if name is entered).
+   - **Manual connection section:**
+     - Divider: "── or connect manually ──"
+     - Text input: "IP:Port" placeholder, e.g., "192.168.1.42:17401"
+     - "Connect" button next to it.
+   - **On join (either discovered or manual):**
+     1. Call `invoke('join_session', { address, displayName })`.
+     2. Show a loading spinner.
+     3. On success: set `isHost` to false, populate stores, navigate to peer session via `dispatch('joined')`.
+     4. On error: show error toast (e.g., "Connection refused", "Session is full").
+
+4. **Wire up Tauri event listeners:**
+
+   In the SessionBrowser component (or a parent), listen for:
+   ```typescript
+   import { listen } from '@tauri-apps/api/event';
+
+   listen('discovery:sessions-updated', (event) => {
+       discoveredSessions.set(event.payload.sessions);
+   });
+   ```
+
+5. **Implement a reusable Toast component** for error/success notifications:
+   - Appears at the top-right of the screen.
+   - Auto-dismisses after 4 seconds.
+   - Supports `error`, `success`, and `info` variants.
+   - Red background for errors, green for success.
+
+6. **Implement a reusable Loading Spinner component:**
+   - Simple CSS spinner in the accent green color.
+   - Used while waiting for create/join operations.
+
+### Acceptance Criteria:
+- Home screen renders with PhaseLock branding and two navigation buttons
+- Create Jam screen collects session name and display name, calls the backend, and navigates on success
+- Session Browser discovers LAN sessions in real-time and displays them
+- Manual IP:port connection works
+- Error states show toast notifications
+- Loading states are shown during async operations
+- All navigation between screens works correctly

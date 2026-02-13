@@ -1,0 +1,75 @@
+You are implementing Step 4 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 1–3 are complete (project scaffolding, message protocol, logging).
+
+## Task: TCP Networking Layer
+
+Implement the TCP networking foundation — listener (host side), client (peer side), connection management, message framing, and heartbeat.
+
+### What to do:
+
+1. **Implement the TCP listener (host side)** in `src-tauri/src/network/tcp.rs`:
+
+   ```rust
+   pub struct TcpHost {
+       listener: TcpListener,
+       connections: Arc<Mutex<HashMap<u32, PeerConnection>>>,
+   }
+
+   pub struct PeerConnection {
+       pub peer_id: u32,
+       pub display_name: String,
+       pub writer: OwnedWriteHalf,  // tokio split TCP stream
+       pub connected_at: Instant,
+   }
+   ```
+
+   - Bind a `tokio::net::TcpListener` on port `17401` (configurable).
+   - Accept incoming connections in a loop (spawned as a tokio task).
+   - For each connection, spawn a reader task that:
+     - Reads length-prefixed messages using the framing from Step 2.
+     - Dispatches received messages via a `tokio::sync::mpsc` channel to the session manager.
+   - Maintain a `HashMap<u32, PeerConnection>` of active peer connections.
+   - Provide methods:
+     - `send_to_peer(peer_id, message)` — send a message to a specific peer.
+     - `broadcast(message)` — send a message to all connected peers.
+     - `disconnect_peer(peer_id)` — close a peer's connection and remove from map.
+
+2. **Implement the TCP client (peer side):**
+
+   ```rust
+   pub struct TcpPeer {
+       writer: OwnedWriteHalf,
+       // reader runs in a spawned task
+   }
+   ```
+
+   - Connect to a host at a given `SocketAddr` using `tokio::net::TcpStream::connect()`.
+   - Split the stream into reader/writer halves.
+   - Spawn a reader task that reads messages and sends them to the session manager via an mpsc channel.
+   - Provide a `send(message)` method.
+
+3. **Implement heartbeat:**
+   - Both host and peer send a `Heartbeat` message every **2 seconds**.
+   - If no message (of any kind) is received from a peer/host within **5 seconds**, consider the connection dead.
+   - On timeout: the host removes the peer from the connection map and notifies the session manager. The peer shows "Host disconnected."
+   - Use a `tokio::time::interval` for sending and track last-received time per connection.
+
+4. **Connection cleanup:**
+   - When a TCP read returns an error or EOF, clean up the connection.
+   - Log all connect/disconnect events at INFO level.
+   - Log all send/receive activity at DEBUG level.
+
+5. **Write integration tests:**
+   - Start a TcpHost on loopback, connect a TcpPeer. Send a `JoinRequest` from peer, verify host receives it.
+   - Host sends `JoinAccepted`, verify peer receives it.
+   - Test broadcast: host sends a message, two connected peers both receive it.
+   - Test heartbeat timeout: connect a peer, don't send any messages, verify disconnection after 5 seconds.
+   - Test clean disconnect: peer sends `LeaveSession`, verify host removes the peer.
+
+### Acceptance Criteria:
+- Host can listen and accept multiple TCP connections
+- Messages are correctly framed, serialized, and deserialized over TCP
+- Heartbeat runs every 2s, timeout triggers at 5s
+- All connection lifecycle events are logged
+- Integration tests pass on loopback

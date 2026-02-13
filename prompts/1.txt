@@ -1,0 +1,96 @@
+You are implementing Step 1 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+## Task: Project Scaffolding
+
+Initialize the full project structure for a Tauri 2 + Svelte application with a Rust backend.
+
+### What to do:
+
+1. **Initialize a Tauri 2 project** with Svelte as the frontend framework. Use the Tauri CLI or set it up manually:
+   - `src/` directory for the Svelte frontend
+   - `src-tauri/` directory for the Rust backend
+
+2. **Set up the Svelte frontend:**
+   - `package.json` with Svelte, Vite, and TypeScript dependencies
+   - `svelte.config.js`
+   - `vite.config.ts`
+   - `tsconfig.json`
+   - `src/main.ts` — Svelte entry point
+   - `src/App.svelte` — Root component (just a placeholder "PhaseLock" heading for now)
+
+3. **Set up the Rust backend (`src-tauri/`):**
+   - `Cargo.toml` with these dependencies:
+     ```toml
+     [dependencies]
+     tauri = { version = "2", features = ["build"] }
+     cpal = "0.15"
+     symphonia = { version = "0.5", features = ["mp3"] }
+     serde = { version = "1", features = ["derive"] }
+     bincode = "1"
+     mdns-sd = "0.11"
+     tokio = { version = "1", features = ["full"] }
+     chrono = "0.4"
+     log = "0.4"
+     parking_lot = "0.12"
+     uuid = { version = "1", features = ["v4", "serde"] }
+     sha2 = "0.10"
+     ```
+   - `tauri.conf.json` with:
+     - App name: "PhaseLock"
+     - Bundle identifier: "com.phaselock.app"
+     - Version: "0.1.0"
+     - Window title: "PhaseLock"
+     - Default window size: 1024x768
+   - `src/main.rs` — Tauri entry point (minimal, just launches the app)
+   - `src/lib.rs` — Declare all modules (empty stubs for now):
+     - `mod session;`
+     - `mod network;`
+     - `mod sync;`
+     - `mod audio;`
+     - `mod queue;`
+     - `mod transfer;`
+     - `mod logging;`
+     - `mod commands;`
+
+4. **Create the full directory structure** with empty `mod.rs` files:
+   ```
+   src-tauri/src/
+   ├── main.rs
+   ├── lib.rs
+   ├── commands.rs
+   ├── session/
+   │   ├── mod.rs
+   │   ├── host.rs
+   │   └── peer.rs
+   ├── network/
+   │   ├── mod.rs
+   │   ├── tcp.rs
+   │   ├── udp.rs
+   │   ├── mdns.rs
+   │   └── messages.rs
+   ├── sync/
+   │   ├── mod.rs
+   │   └── clock.rs
+   ├── audio/
+   │   ├── mod.rs
+   │   ├── decoder.rs
+   │   ├── playback.rs
+   │   └── scheduler.rs
+   ├── queue/
+   │   ├── mod.rs
+   │   └── manager.rs
+   ├── transfer/
+   │   ├── mod.rs
+   │   └── file_transfer.rs
+   └── logging/
+       ├── mod.rs
+       └── logger.rs
+   ```
+
+5. **Verify the project builds and launches** on your platform. The app window should open and show the placeholder "PhaseLock" heading.
+
+### Acceptance Criteria:
+- `npm install` succeeds
+- `cargo build` succeeds in `src-tauri/`
+- `cargo tauri dev` launches the app window with "PhaseLock" displayed
+- All module stubs exist and compile (empty but declared)

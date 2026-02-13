@@ -1,0 +1,178 @@
+You are implementing Step 20 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 1–19 are complete (full app is functional with all features and error handling).
+
+## Task: CI/CD & Packaging
+
+Set up GitHub Actions CI/CD for cross-platform builds and configure Tauri to produce installers for Windows, macOS, and Linux.
+
+### What to do:
+
+1. **Configure Tauri bundler settings** in `src-tauri/tauri.conf.json`:
+
+   Ensure the bundle section is configured:
+   ```json
+   {
+       "bundle": {
+           "active": true,
+           "targets": "all",
+           "identifier": "com.phaselock.app",
+           "icon": [
+               "icons/32x32.png",
+               "icons/128x128.png",
+               "icons/128x128@2x.png",
+               "icons/icon.icns",
+               "icons/icon.ico"
+           ],
+           "resources": [],
+           "shortDescription": "Synchronized music playback for groups",
+           "longDescription": "PhaseLock allows multiple devices to connect in a jam session and play music in perfect sync.",
+           "copyright": "",
+           "category": "Music",
+           "windows": {
+               "wix": {
+                   "language": "en-US"
+               }
+           },
+           "macOS": {
+               "minimumSystemVersion": "10.15"
+           },
+           "linux": {
+               "appimage": {
+                   "bundleMediaFramework": true
+               }
+           }
+       }
+   }
+   ```
+
+   Target formats:
+   - **Windows:** `.msi` (via WiX) and `.exe` (NSIS)
+   - **macOS:** `.dmg` and `.app`
+   - **Linux:** `.AppImage` and `.deb`
+
+2. **Create app icons:**
+   - Generate icons in all required sizes from a single source image.
+   - Place in `src-tauri/icons/`:
+     - `icon.ico` (Windows)
+     - `icon.icns` (macOS)
+     - `32x32.png`, `128x128.png`, `128x128@2x.png` (Linux / general)
+   - Use Tauri's `cargo tauri icon` command to generate from a source PNG.
+
+3. **Create the GitHub Actions workflow** at `.github/workflows/release.yml`:
+
+   ```yaml
+   name: Build & Release
+
+   on:
+     push:
+       tags:
+         - 'v*'
+     workflow_dispatch:
+
+   jobs:
+     build:
+       strategy:
+         fail-fast: false
+         matrix:
+           include:
+             - platform: windows-latest
+               target: x86_64-pc-windows-msvc
+             - platform: macos-latest
+               target: aarch64-apple-darwin
+             - platform: macos-latest
+               target: x86_64-apple-darwin
+             - platform: ubuntu-22.04
+               target: x86_64-unknown-linux-gnu
+
+       runs-on: ${{ matrix.platform }}
+
+       steps:
+         - uses: actions/checkout@v4
+
+         - name: Install Rust
+           uses: dtolnay/rust-toolchain@stable
+           with:
+             targets: ${{ matrix.target }}
+
+         - name: Install Node.js
+           uses: actions/setup-node@v4
+           with:
+             node-version: 20
+
+         - name: Install Linux dependencies
+           if: matrix.platform == 'ubuntu-22.04'
+           run: |
+             sudo apt-get update
+             sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
+
+         - name: Install frontend dependencies
+           run: npm install
+
+         - name: Build Tauri app
+           uses: tauri-apps/tauri-action@v0
+           env:
+             GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+           with:
+             tagName: ${{ github.ref_name }}
+             releaseName: 'PhaseLock ${{ github.ref_name }}'
+             releaseBody: 'See the assets to download PhaseLock for your platform.'
+             releaseDraft: true
+             prerelease: false
+             args: --target ${{ matrix.target }}
+   ```
+
+4. **Create a CI workflow** for pull requests at `.github/workflows/ci.yml`:
+
+   ```yaml
+   name: CI
+
+   on:
+     pull_request:
+     push:
+       branches: [main]
+
+   jobs:
+     check:
+       runs-on: ubuntu-22.04
+       steps:
+         - uses: actions/checkout@v4
+         - uses: dtolnay/rust-toolchain@stable
+         - name: Install Linux dependencies
+           run: |
+             sudo apt-get update
+             sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
+         - name: Install frontend dependencies
+           run: npm install
+         - name: Rust fmt check
+           run: cd src-tauri && cargo fmt --check
+         - name: Rust clippy
+           run: cd src-tauri && cargo clippy -- -D warnings
+         - name: Rust tests
+           run: cd src-tauri && cargo test
+         - name: Frontend build
+           run: npm run build
+   ```
+
+5. **Add code quality configuration:**
+   - `src-tauri/rustfmt.toml` — Rust formatting config.
+   - `.gitignore` — Ensure `target/`, `node_modules/`, `dist/`, and build artifacts are ignored.
+   - `README.md` — Update with:
+     - Project description.
+     - How to build from source.
+     - How to download pre-built releases.
+     - Development setup instructions.
+
+6. **Test the build locally:**
+   - Run `cargo tauri build` on your platform.
+   - Verify the installer is produced in `src-tauri/target/release/bundle/`.
+   - Install the built app and verify it launches and works independently of the dev environment.
+
+### Acceptance Criteria:
+- `cargo tauri build` produces installers on all three platforms
+- GitHub Actions CI runs on every PR: fmt, clippy, tests, frontend build
+- GitHub Actions release workflow builds for Windows, macOS (both architectures), and Linux
+- Release workflow creates a draft GitHub Release with all platform artifacts
+- App icons appear correctly in the installed app
+- README has build and usage instructions
+- `.gitignore` is comprehensive

@@ -1,0 +1,110 @@
+You are implementing Step 10 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 5, 7, and 9 are complete (UDP clock sync, session manager, audio engine).
+
+## Task: Playback Scheduler & Synchronized Command Dispatch
+
+Implement the core sync logic: the host dispatches playback commands with staggered timing based on per-peer latencies, and peers schedule local playback at the precise target time.
+
+### What to do:
+
+1. **Implement the playback scheduler** in `src-tauri/src/audio/scheduler.rs`:
+
+   **Host side — Staggered Command Dispatch:**
+
+   When the host initiates a play (or resume/seek) command:
+
+   ```rust
+   pub struct PlaybackScheduler {
+       host_clock_tracker: Arc<HostClockTracker>,
+       tcp_host: Arc<TcpHost>,
+       audio_output: Arc<AudioOutput>,
+   }
+
+   impl PlaybackScheduler {
+       /// Schedule synchronized playback across all peers
+       pub async fn schedule_play(
+           &self,
+           file_id: Uuid,
+           position_samples: u64,
+           peers: &HashMap<u32, PeerState>,
+       ) -> Result<()>;
+   }
+   ```
+
+   The algorithm:
+   1. Read the per-peer latency map from `HostClockTracker`.
+   2. Find the **maximum one-way latency** among all peers: `max_latency`.
+   3. Calculate `target_time = now() + max_latency + safety_margin` (safety margin = 50 ms to account for jitter and processing time).
+   4. For each peer, calculate when to send the command:
+      - `send_delay = max_latency - peer_latency` (so the highest-latency peer gets the command immediately, and lower-latency peers get it later).
+   5. Spawn a task for each peer that:
+      - Sleeps for `send_delay`.
+      - Sends `PlayCommand { file_id, position_samples, target_time_ns }` via TCP.
+   6. Schedule local playback: `audio_output.play_at(target_time)`.
+
+   Apply the same staggered dispatch logic for:
+   - `ResumeCommand`
+   - `SeekCommand`
+
+   For `PauseCommand` and `StopCommand`: these are less time-critical, so just broadcast immediately to all peers (no staggering needed). All peers pause/stop as soon as they receive the command.
+
+2. **Peer side — Receiving and executing commands:**
+
+   In the peer session handler, when a playback command is received:
+
+   ```rust
+   fn handle_play_command(&self, cmd: PlayCommand) {
+       // Convert target_time from host clock to local clock using ClockSync
+       let local_target = self.clock_sync.host_to_local(cmd.target_time_ns);
+       let target_instant = self.base_instant + Duration::from_nanos(local_target);
+
+       // Load the track if not already loaded
+       self.audio_output.seek(cmd.position_samples);
+       self.audio_output.play_at(target_instant);
+   }
+   ```
+
+   Similarly for resume and seek commands.
+
+   For pause/stop: execute immediately on receipt.
+
+3. **Time reference management:**
+
+   Both host and peer need a shared understanding of "time as nanoseconds":
+   - At app startup, record a `base_instant = Instant::now()`.
+   - All nanosecond timestamps in messages are relative to this base (or use the system's monotonic clock directly).
+   - The `ClockSync` module converts between host's and peer's monotonic clocks using the computed offset.
+
+4. **Implement the host's play/pause/stop/seek public API:**
+
+   ```rust
+   impl PlaybackScheduler {
+       pub async fn play(&self, file_id: Uuid, position: u64, peers: &HashMap<u32, PeerState>) -> Result<()>;
+       pub async fn pause(&self, position: u64) -> Result<()>;
+       pub async fn resume(&self, position: u64, peers: &HashMap<u32, PeerState>) -> Result<()>;
+       pub async fn stop(&self) -> Result<()>;
+       pub async fn seek(&self, position: u64, peers: &HashMap<u32, PeerState>) -> Result<()>;
+   }
+   ```
+
+5. **Write unit tests:**
+   - Given 3 peers with latencies 5 ms, 20 ms, 50 ms:
+     - Verify `target_time = now + 50ms + 50ms_margin = now + 100ms`.
+     - Verify send delays: peer1 = 45ms, peer2 = 30ms, peer3 = 0ms.
+   - Test `host_to_local` conversion produces correct target instant on the peer side.
+
+6. **Write an integration test:**
+   - Set up a host and 2 peers on loopback.
+   - Host schedules a play command.
+   - Both peers receive `PlayCommand` messages.
+   - Verify both peers' `target_time_ns` values are the same.
+   - Verify the peers would schedule playback at approximately the same wall-clock time (within 1–2 ms on loopback).
+
+### Acceptance Criteria:
+- Host dispatches playback commands with staggered timing
+- Peers receive commands and schedule playback at the correct local time
+- Pause and stop are broadcast immediately
+- Seek works with the same staggered dispatch as play
+- Integration test shows peers receive commands targeting the same wall-clock time
+- All tests pass

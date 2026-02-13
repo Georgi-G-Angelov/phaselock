@@ -1,0 +1,108 @@
+You are implementing Step 17 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 13 and 14 are complete (Tauri IPC commands, global styles & layout).
+
+## Task: Frontend — Peer Session Screen
+
+Implement the peer session screen with read-only now-playing view, read-only queue, volume/mute controls, and a song request button.
+
+### What to do:
+
+1. **Implement the Peer Session screen** (`src/lib/components/PeerSession.svelte`):
+
+   Two-panel layout:
+
+   ```
+   ┌─────────────────────────────────────┬───────────────────────┐
+   │   Now Playing (read-only)           │  Queue (read-only)    │
+   │                                     │                       │
+   │   Song Title.mp3                    │  1. Song A            │
+   │   ───●──────────── 2:34             │  2. Song B            │
+   │                                     │  3. Song C            │
+   │                                     │                       │
+   │   🔊 ────●────────                  │  [🎵 Request Song]   │
+   └─────────────────────────────────────┴───────────────────────┘
+   ```
+
+   - Header bar: session name (left), connection status + latency (right, e.g., "Connected — latency: 3ms").
+   - "Leave Jam" button in the header.
+
+2. **Now Playing panel (read-only):**
+
+   Reuse or adapt the `NowPlaying.svelte` component with a `readonly` prop:
+   - Track name (large text). If nothing playing: "Waiting for host to play a track..."
+   - Progress bar:
+     - Subscribe to `playbackStore`.
+     - Show elapsed / total (e.g., "1:23 / 3:45").
+     - **Not clickable** (no seeking for peers).
+   - No transport controls (no play/pause/stop/seek/skip buttons).
+
+3. **Volume / mute control:**
+
+   Below the now-playing area:
+   - Volume slider (range 0–100, mapped to 0.0–1.0).
+   - Speaker icon that toggles mute on click.
+   - On change: call `invoke('set_volume', { volume })`.
+   - Subscribe to `volumeStore` for the current value.
+   - Visual: 🔊 icon when unmuted, 🔇 when muted.
+
+4. **Queue panel (read-only):**
+
+   Reuse or adapt the `Queue.svelte` component with a `readonly` prop:
+   - Subscribe to `queueStore`.
+   - Display queue items:
+     - Index number
+     - Track name
+     - "Added by {name}"
+     - Status indicator (same as host: transferring / ready / playing)
+   - No remove buttons, no drag-and-drop reorder.
+   - Highlight the currently playing track.
+   - "Request Song" button at the bottom:
+     - Opens native file picker (filtered to .mp3).
+     - Calls `invoke('request_song', { filePath })`.
+     - Shows a toast: "Song request sent!" (success) or error if it fails.
+     - If a request is pending, disable the button and show "Request pending..."
+
+5. **Connection status in the header:**
+
+   - Subscribe to the session and clock sync data.
+   - Show: "Connected — latency: {X}ms"
+   - Latency color follows the same scheme:
+     - Green text: < 10 ms
+     - Yellow text: 10–100 ms
+     - Red text: > 100 ms
+   - If connection is lost: show "Disconnected" in red.
+
+6. **Wire up Tauri event listeners:**
+
+   ```typescript
+   listen('queue:updated', ...)
+   listen('playback:state-changed', ...)
+   listen('playback:position', ...)
+   listen('session:ended', ...)
+   listen('session:host-disconnected', ...)
+   listen('transfer:progress', ...)
+   listen('sync:latency-updated', ...)
+   listen('error:general', ...)
+   ```
+
+   On `session:ended` or `session:host-disconnected`:
+   - Show a modal/toast: "Host disconnected — session ended."
+   - Navigate back to home via `dispatch('disconnected')`.
+
+   Clean up all listeners in `onDestroy`.
+
+7. **"Leave Jam" button:**
+   - Calls `invoke('leave_session')`.
+   - Navigates back to home via `dispatch('disconnected')`.
+   - No confirmation needed (leaving is non-destructive for the peer).
+
+### Acceptance Criteria:
+- Two-panel layout renders correctly
+- Now-playing shows track info and progress (read-only, no controls)
+- Volume slider and mute toggle work and call the backend
+- Queue is displayed in read-only mode with correct status indicators
+- "Request Song" button opens file picker and sends request
+- Connection status and latency are displayed live in the header
+- Host disconnect triggers navigation back to home with a message
+- All event listeners are set up and cleaned up properly

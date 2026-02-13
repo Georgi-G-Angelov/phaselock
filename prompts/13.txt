@@ -1,0 +1,164 @@
+You are implementing Step 13 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 7–12 are complete (session manager, file transfer, audio engine, playback scheduler, queue manager, song requests).
+
+## Task: Tauri IPC Commands & Events
+
+Bridge the Rust backend to the Svelte frontend by implementing Tauri IPC commands (frontend → backend) and events (backend → frontend).
+
+### What to do:
+
+1. **Implement Tauri commands** in `src-tauri/src/commands.rs`:
+
+   These are async functions annotated with `#[tauri::command]` that the Svelte frontend calls via `invoke()`.
+
+   **Session commands:**
+   ```rust
+   #[tauri::command]
+   async fn create_session(session_name: String, display_name: String) -> Result<SessionInfo, String>;
+
+   #[tauri::command]
+   async fn join_session(address: String, display_name: String) -> Result<SessionInfo, String>;
+
+   #[tauri::command]
+   async fn leave_session() -> Result<(), String>;
+
+   #[tauri::command]
+   async fn get_discovered_sessions() -> Result<Vec<DiscoveredSession>, String>;
+   ```
+
+   **Playback commands (host only):**
+   ```rust
+   #[tauri::command]
+   async fn play() -> Result<(), String>;
+
+   #[tauri::command]
+   async fn pause() -> Result<(), String>;
+
+   #[tauri::command]
+   async fn stop() -> Result<(), String>;
+
+   #[tauri::command]
+   async fn seek(position_ms: u64) -> Result<(), String>;
+
+   #[tauri::command]
+   async fn skip() -> Result<(), String>;
+   ```
+
+   **Queue commands (host only):**
+   ```rust
+   #[tauri::command]
+   async fn add_song(file_path: String) -> Result<(), String>;
+
+   #[tauri::command]
+   async fn remove_from_queue(track_id: String) -> Result<(), String>;
+
+   #[tauri::command]
+   async fn reorder_queue(from_index: usize, to_index: usize) -> Result<(), String>;
+   ```
+
+   **Song request commands:**
+   ```rust
+   #[tauri::command]
+   async fn request_song(file_path: String) -> Result<(), String>;  // peer
+
+   #[tauri::command]
+   async fn accept_song_request(request_id: String) -> Result<(), String>;  // host
+
+   #[tauri::command]
+   async fn reject_song_request(request_id: String) -> Result<(), String>;  // host
+   ```
+
+   **Local controls (both):**
+   ```rust
+   #[tauri::command]
+   async fn set_volume(volume: f32) -> Result<(), String>;
+   ```
+
+2. **Implement Tauri events** (backend → frontend):
+
+   Use `app_handle.emit()` to push real-time updates to the frontend. Define these event types:
+
+   ```rust
+   // Session events
+   "session:peer-joined"     → { peer_id, display_name }
+   "session:peer-left"       → { peer_id }
+   "session:ended"           → {}
+   "session:host-disconnected" → {}
+
+   // Queue events
+   "queue:updated"           → { queue: Vec<QueueItem> }
+
+   // Playback events
+   "playback:state-changed"  → { state: "playing"|"paused"|"stopped", file_name, position_ms, duration_ms }
+   "playback:position"       → { position_ms, duration_ms }  // emitted every 500ms during playback
+   "playback:track-finished" → {}
+
+   // Transfer events
+   "transfer:progress"       → { file_id, file_name, progress: 0.0-1.0 }
+   "transfer:complete"       → { file_id, file_name }
+   "transfer:failed"         → { file_id, file_name, error }
+
+   // Song request events (host)
+   "request:incoming"        → { request_id, peer_name, file_name, file_size }
+   "request:upload-progress" → { request_id, progress: 0.0-1.0 }
+
+   // Discovery events
+   "discovery:sessions-updated" → { sessions: Vec<DiscoveredSession> }
+
+   // Peer sync events
+   "sync:latency-updated"    → { peer_id, latency_ms }
+
+   // Error events
+   "error:general"           → { message: String }
+   ```
+
+3. **State management:**
+
+   Use Tauri's `manage()` to store shared state accessible by all commands:
+
+   ```rust
+   pub struct AppState {
+       pub session: Mutex<Option<Session>>,  // Host or Peer session
+       pub audio: Mutex<AudioOutput>,
+       pub queue: Mutex<QueueManager>,
+       // ... other shared state
+   }
+   ```
+
+   Register it in the Tauri builder:
+   ```rust
+   tauri::Builder::default()
+       .manage(AppState::new())
+       .invoke_handler(tauri::generate_handler![
+           create_session, join_session, leave_session,
+           get_discovered_sessions,
+           play, pause, stop, seek, skip,
+           add_song, remove_from_queue, reorder_queue,
+           request_song, accept_song_request, reject_song_request,
+           set_volume,
+       ])
+   ```
+
+4. **Implement a playback position ticker:**
+   - While a track is playing, spawn a task that emits `playback:position` every 500 ms with the current position in milliseconds and the total duration.
+   - Stop the ticker when playback pauses or stops.
+
+5. **Define TypeScript types** in `src/lib/types.ts` that mirror the Rust event payloads:
+
+   ```typescript
+   export interface PeerInfo { peer_id: number; display_name: string; }
+   export interface QueueItem { id: string; file_name: string; duration_secs: number; added_by: string; status: string; }
+   export interface DiscoveredSession { session_name: string; host_name: string; address: string; peer_count: number; max_peers: number; }
+   export interface PlaybackState { state: 'playing' | 'paused' | 'stopped'; file_name: string; position_ms: number; duration_ms: number; }
+   export interface SongRequest { request_id: string; peer_name: string; file_name: string; file_size: number; }
+   export interface TransferProgress { file_id: string; file_name: string; progress: number; }
+   ```
+
+### Acceptance Criteria:
+- All Tauri commands are registered and callable from the frontend
+- All events are emitted at the right times and contain correct payloads
+- TypeScript types match the Rust event payloads
+- State is shared correctly between commands
+- Playback position ticker works during playback
+- The app still compiles and runs

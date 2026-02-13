@@ -1,0 +1,98 @@
+You are implementing Step 9 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Step 1 (Project Scaffolding) is complete.
+
+## Task: Audio Engine (Decode & Playback)
+
+Implement the audio engine that decodes MP3 files into PCM sample buffers and plays them through the system's audio output using `symphonia` and `cpal`.
+
+### What to do:
+
+1. **Implement the MP3 decoder** in `src-tauri/src/audio/decoder.rs`:
+
+   ```rust
+   pub struct DecodedAudio {
+       pub samples: Vec<f32>,      // interleaved PCM samples (L, R, L, R, ...)
+       pub sample_rate: u32,       // e.g., 44100, 48000
+       pub channels: u16,          // typically 2 (stereo)
+       pub total_frames: u64,      // total number of frames (samples / channels)
+       pub duration_secs: f64,     // total duration in seconds
+   }
+
+   /// Decode an MP3 file from raw bytes into PCM samples
+   pub fn decode_mp3(data: &[u8]) -> Result<DecodedAudio, DecodeError>;
+   ```
+
+   Implementation:
+   - Use `symphonia::core::io::MediaSourceStream` with a `std::io::Cursor<&[u8]>` as the source.
+   - Use `symphonia::default::get_probe()` to probe the format.
+   - Create a decoder for the first audio track.
+   - Iterate over all packets, decode each into an `AudioBuffer`, and convert samples to `f32`.
+   - Interleave channels into a single `Vec<f32>`.
+   - Extract sample rate, channel count, and compute duration.
+
+2. **Implement the audio output** in `src-tauri/src/audio/playback.rs`:
+
+   ```rust
+   pub struct PlaybackState {
+       pub buffer: Arc<Vec<f32>>,
+       pub sample_rate: u32,
+       pub channels: u16,
+       pub play_at: Option<Instant>,
+       pub position: AtomicUsize,           // current sample index
+       pub state: AtomicU8,                 // 0=Stopped, 1=Waiting, 2=Playing, 3=Paused
+   }
+
+   pub struct AudioOutput {
+       stream: cpal::Stream,
+       state: Arc<PlaybackState>,
+   }
+   ```
+
+   Implementation:
+   - Initialize cpal, get the default output device and its preferred config.
+   - Request the **smallest buffer size** available (for lowest latency).
+   - Build an output stream with a callback that:
+     1. Checks the `state` field.
+     2. If `Stopped` or `Paused`: write silence.
+     3. If `Waiting`: check if `Instant::now() >= play_at`. If yes, transition to `Playing`. If no, write silence.
+     4. If `Playing`: copy samples from `buffer` starting at `position` into the output. Advance `position`. If `position` reaches the end of the buffer, transition to `Stopped` (track finished — notify session manager via a callback or channel).
+   - Handle sample rate mismatch: if the MP3 sample rate differs from the output device rate, note this. For MVP, log a warning (or use a simple linear resampler). Most MP3s are 44.1 kHz and most devices support it.
+
+   Provide methods:
+   - `load_track(decoded: DecodedAudio)` — load a decoded track into the playback state.
+   - `play_at(instant: Instant)` — schedule playback to start at a precise moment.
+   - `pause()` — pause playback, record current position.
+   - `resume_at(instant: Instant)` — resume from current position at a precise moment.
+   - `stop()` — stop playback, reset position to 0.
+   - `seek(position_samples: u64)` — set position to a specific sample offset.
+   - `get_position() -> u64` — return current sample position.
+   - `get_state() -> PlaybackStateEnum` — return current state.
+   - `set_volume(volume: f32)` — scale output samples by this factor (0.0–1.0).
+   - `on_track_finished(callback)` — register a callback for when the track ends.
+
+3. **Handle audio device detection:**
+   - If no output device is found, return an error that can be shown to the user ("No audio output detected").
+   - Log the selected device name and config at INFO level.
+
+4. **Write unit tests:**
+   - Decode a known MP3 file (include a small test MP3 in the test fixtures). Verify:
+     - `sample_rate` is correct (e.g., 44100).
+     - `channels` is 2.
+     - `total_frames` is reasonable for the file's duration.
+     - `samples.len() == total_frames * channels`.
+   - Test that `PlaybackState` transitions work correctly:
+     - Stopped → load → Waiting → play_at triggers → Playing → end of buffer → Stopped.
+     - Playing → pause → Paused → resume → Playing.
+     - Playing → seek → position updated.
+
+5. **Write a manual smoke test:**
+   - Decode a test MP3 file, load it, call `play_at(Instant::now())`, and verify audio plays through speakers.
+
+### Acceptance Criteria:
+- MP3 files decode correctly into PCM f32 sample buffers
+- Audio plays through the default output device via cpal
+- Playback can be started at a precise `Instant`
+- Pause, resume, stop, seek, and volume control all work
+- No audio device → graceful error
+- Unit tests pass

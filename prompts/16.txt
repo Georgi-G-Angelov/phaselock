@@ -1,0 +1,111 @@
+You are implementing Step 16 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 13 and 14 are complete (Tauri IPC commands, global styles & layout).
+
+## Task: Frontend — Host Session Screen
+
+Implement the full host session screen with peer list, now-playing controls, playback queue, and song request management.
+
+### What to do:
+
+1. **Implement the Host Session screen** (`src/lib/components/HostSession.svelte`):
+
+   Three-panel layout as described in the spec:
+
+   ```
+   ┌──────────────┬──────────────────────────┬───────────────────┐
+   │  Peers       │   Now Playing            │  Queue            │
+   │              │                          │                   │
+   │  (left)      │   (center)               │  (right)          │
+   ├──────────────┴──────────────────────────┴───────────────────┤
+   │  Song Requests (bottom)                                     │
+   └─────────────────────────────────────────────────────────────┘
+   ```
+
+   - Header bar: session name (left), IP:port (right), "{n} peers connected" (center).
+   - "End Session" button in the header (danger style).
+
+2. **Implement the Peer List panel** (`src/lib/components/PeerList.svelte`):
+
+   - Subscribe to `peersStore`.
+   - Listen for `sync:latency-updated` events to track per-peer latency.
+   - For each peer, show:
+     - Latency indicator dot:
+       - 🟢 Green: < 10 ms
+       - 🟡 Yellow: 10–100 ms
+       - 🔴 Red: > 100 ms
+     - Display name
+     - Latency value (e.g., "3ms")
+   - If no peers: "Waiting for peers to join..."
+
+3. **Implement the Now Playing panel** (`src/lib/components/NowPlaying.svelte`):
+
+   For the host version (with controls):
+   - Track name (large text). If nothing playing: "No track playing".
+   - Progress bar:
+     - Subscribe to `playbackStore`.
+     - Show elapsed time / total duration (e.g., "1:23 / 3:45").
+     - **Clickable/draggable** for seeking — on click, calculate position and call `invoke('seek', { position_ms })`.
+   - Transport controls (icon buttons):
+     - ⏮ Previous / Skip back (disabled for MVP — just show Skip)
+     - ⏸ Play/Pause toggle — calls `invoke('play')` or `invoke('pause')`.
+     - ⏹ Stop — calls `invoke('stop')`.
+     - ⏭ Skip — calls `invoke('skip')`.
+   - Play button should be **disabled** if no track is loaded, or if a file is still transferring to peers. Show tooltip: "Waiting for all peers to receive the file."
+
+4. **Implement the Queue panel** (`src/lib/components/Queue.svelte`):
+
+   For the host version (editable):
+   - Subscribe to `queueStore`.
+   - "Add Song" button at the top — opens native file picker (filtered to .mp3), calls `invoke('add_song', { filePath })`.
+   - List of queue items, each showing:
+     - Index number
+     - Track name
+     - "Added by {name}"
+     - Status indicator (transferring spinner / ready checkmark / playing animation)
+     - ✕ Remove button — calls `invoke('remove_from_queue', { trackId })`.
+   - **Drag-and-drop reorder**: implement drag handles. On drop, call `invoke('reorder_queue', { fromIndex, toIndex })`.
+   - Highlight the currently playing track.
+   - If queue is empty: "Queue is empty. Add a song to get started!"
+
+5. **Implement the Song Requests panel** (`src/lib/components/SongRequests.svelte`):
+
+   - Subscribe to `songRequests` store.
+   - Listen for `request:incoming` events and add to the store.
+   - For each pending request, show:
+     - "{peer_name} wants to add "{file_name}" ({file_size_formatted})"
+     - ✓ Accept button (green) — calls `invoke('accept_song_request', { requestId })`.
+     - ✗ Reject button (red) — calls `invoke('reject_song_request', { requestId })`.
+   - Show upload progress bar for accepted requests that are uploading (listen to `request:upload-progress`).
+   - If no pending requests: collapse the panel or show "No pending requests."
+
+6. **Wire up all Tauri event listeners** at the HostSession level:
+
+   ```typescript
+   listen('session:peer-joined', ...)
+   listen('session:peer-left', ...)
+   listen('queue:updated', ...)
+   listen('playback:state-changed', ...)
+   listen('playback:position', ...)
+   listen('playback:track-finished', ...)
+   listen('transfer:progress', ...)
+   listen('transfer:complete', ...)
+   listen('request:incoming', ...)
+   listen('sync:latency-updated', ...)
+   listen('error:general', ...)
+   ```
+
+   Clean up all listeners in `onDestroy`.
+
+7. **"End Session" button:**
+   - Shows a confirmation dialog: "End this jam session? All peers will be disconnected."
+   - On confirm: calls `invoke('leave_session')`, navigates back to home via `dispatch('ended')`.
+
+### Acceptance Criteria:
+- Three-panel layout renders correctly
+- Peer list shows connected peers with live latency indicators
+- Transport controls (play, pause, stop, seek, skip) work and call the backend
+- Queue displays songs with status indicators, supports add/remove/reorder
+- Song requests show with accept/reject buttons
+- All real-time events update the UI
+- End Session works with confirmation

@@ -1,0 +1,95 @@
+You are implementing Step 12 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 8 and 11 are complete (file transfer, queue manager).
+
+## Task: Song Request Flow
+
+Implement the ability for peers to request songs by uploading an MP3 to the host, who can accept or reject the request. On accept, the host distributes the file to all other peers and adds it to the queue.
+
+### What to do:
+
+1. **Peer side — Submitting a song request:**
+
+   When a peer wants to request a song:
+   1. Peer opens a file picker and selects an MP3 file.
+   2. Peer reads the file and computes its SHA-256 hash and file size.
+   3. Peer sends `SongRequest { file_name, file_size }` to the host over TCP.
+   4. Peer waits for `SongRequestAccepted` or `SongRequestRejected`.
+   5. If accepted:
+      - Peer sends the file in **64 KB chunks** as `SongUploadChunk { request_id, offset, data }`.
+      - After all chunks sent, peer sends `SongUploadComplete { request_id, sha256 }`.
+   6. If rejected: show a toast notification "Song request rejected."
+
+2. **Host side — Receiving and managing song requests:**
+
+   ```rust
+   pub struct SongRequestManager {
+       pending_requests: Vec<PendingRequest>,
+       active_uploads: HashMap<Uuid, IncomingUpload>,
+   }
+
+   pub struct PendingRequest {
+       pub request_id: Uuid,
+       pub peer_id: u32,
+       pub peer_name: String,
+       pub file_name: String,
+       pub file_size: u64,
+   }
+
+   struct IncomingUpload {
+       request_id: Uuid,
+       file_name: String,
+       expected_size: u64,
+       data: Vec<u8>,
+       bytes_received: u64,
+   }
+   ```
+
+   When the host receives a `SongRequest`:
+   1. Generate a `request_id` (Uuid).
+   2. Add to `pending_requests`.
+   3. Emit an event to the UI showing the request (peer name, file name, file size).
+
+   When the host **accepts** a request:
+   1. Send `SongRequestAccepted { request_id }` to the requesting peer.
+   2. Create an `IncomingUpload` entry.
+   3. Receive `SongUploadChunk` messages and assemble the file.
+   4. On `SongUploadComplete`: verify SHA-256 hash.
+     - If hash matches: decode the MP3 to get duration, add to queue via QueueManager, and distribute the file to all other peers using the FileTransferManager.
+     - If hash mismatch: log error, notify host UI.
+
+   When the host **rejects** a request:
+   1. Send `SongRequestRejected { request_id }` to the requesting peer.
+   2. Remove from `pending_requests`.
+
+3. **Integrate with existing modules:**
+   - **Queue Manager:** Call `queue.add(file_name, duration, peer_name)` when a request is accepted and file is received.
+   - **File Transfer:** Call `file_transfer.start_transfer(file_data, peer_ids, tcp_host)` to distribute to all peers (excluding the requesting peer, who already has it — or include them for simplicity).
+   - **Audio Decoder:** Call `decode_mp3(&file_data)` to get the duration for the QueueItem.
+
+4. **Handle edge cases:**
+   - Peer disconnects mid-upload: cancel the upload, remove the pending request.
+   - Invalid MP3 file (decode fails): notify host, don't add to queue.
+   - File too large (> 50 MB): reject automatically with a message.
+
+5. **Write unit tests:**
+   - Test the request lifecycle: create request → accept → upload chunks → complete → verify file assembled correctly.
+   - Test reject: create request → reject → verify removed from pending.
+   - Test hash mismatch on upload: verify error is handled.
+
+6. **Write an integration test:**
+   - Set up host and peer on loopback.
+   - Peer sends a SongRequest.
+   - Host accepts.
+   - Peer uploads a small test file.
+   - Verify host receives the complete file with correct hash.
+   - Verify the track is added to the queue.
+
+### Acceptance Criteria:
+- Peers can submit song requests with file name and size
+- Host sees pending requests in the UI and can accept/reject
+- On accept, peer uploads the file, host verifies and adds to queue
+- Host distributes the file to all other peers
+- Rejection is communicated to the peer
+- Edge cases handled (disconnect, invalid file, too large)
+- All tests pass

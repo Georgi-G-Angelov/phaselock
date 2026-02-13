@@ -1,0 +1,121 @@
+You are implementing Step 14 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Step 1 (Project Scaffolding) is complete.
+
+## Task: Frontend — Global Styles & Layout
+
+Implement the Spotify-inspired dark theme CSS and the basic app shell layout with routing for the Svelte frontend.
+
+### What to do:
+
+1. **Implement the global stylesheet** in `src/styles/global.css`:
+
+   ```css
+   /* Color palette */
+   :root {
+       --bg-primary: #121212;
+       --bg-surface: #181818;
+       --bg-elevated: #282828;
+       --accent-green: #1DB954;
+       --accent-green-hover: #1ED760;
+       --text-primary: #FFFFFF;
+       --text-secondary: #B3B3B3;
+       --error-red: #E22134;
+       --border-subtle: #333333;
+   }
+   ```
+
+   Include:
+   - CSS reset / normalize.
+   - Body styles: `background: var(--bg-primary); color: var(--text-primary); font-family: system-ui, -apple-system, sans-serif;`
+   - Typography scale: headings, body text, small text.
+   - Button styles:
+     - Primary button (green): `background: var(--accent-green);` with hover state.
+     - Secondary button (outline or subtle background).
+     - Danger button (red): for reject actions.
+     - Icon button: for transport controls.
+   - Input field styles: dark background, subtle border, focus ring with green accent.
+   - Card / panel styles: `background: var(--bg-surface); border-radius: 8px;`
+   - Scrollbar styling (dark scrollbar to match theme).
+   - Utility classes: `.flex`, `.gap-*`, `.text-secondary`, etc.
+
+2. **Set up routing** in `src/App.svelte`:
+
+   Since PhaseLock has only a few screens and no URL-based routing is needed, use a simple state-based router:
+
+   ```svelte
+   <script lang="ts">
+       import HomeScreen from './lib/components/HomeScreen.svelte';
+       import CreateJam from './lib/components/CreateJam.svelte';
+       import SessionBrowser from './lib/components/SessionBrowser.svelte';
+       import HostSession from './lib/components/HostSession.svelte';
+       import PeerSession from './lib/components/PeerSession.svelte';
+
+       type Screen = 'home' | 'create' | 'browse' | 'host-session' | 'peer-session';
+       let currentScreen: Screen = 'home';
+   </script>
+
+   {#if currentScreen === 'home'}
+       <HomeScreen on:create={() => currentScreen = 'create'} on:join={() => currentScreen = 'browse'} />
+   {:else if currentScreen === 'create'}
+       <CreateJam on:created={() => currentScreen = 'host-session'} on:back={() => currentScreen = 'home'} />
+   {:else if currentScreen === 'browse'}
+       <SessionBrowser on:joined={() => currentScreen = 'peer-session'} on:back={() => currentScreen = 'home'} />
+   {:else if currentScreen === 'host-session'}
+       <HostSession on:ended={() => currentScreen = 'home'} />
+   {:else if currentScreen === 'peer-session'}
+       <PeerSession on:disconnected={() => currentScreen = 'home'} />
+   {/if}
+   ```
+
+3. **Create Svelte stores** in `src/lib/stores/`:
+
+   Create these stores that will be populated by Tauri events (wired up in Step 15–17):
+
+   ```typescript
+   // src/lib/stores/session.ts
+   export const sessionStore = writable<SessionState | null>(null);
+   export const peersStore = writable<PeerInfo[]>([]);
+   export const isHost = writable<boolean>(false);
+
+   // src/lib/stores/playback.ts
+   export const playbackStore = writable<PlaybackState>({
+       state: 'stopped', file_name: '', position_ms: 0, duration_ms: 0
+   });
+   export const volumeStore = writable<number>(1.0);
+
+   // src/lib/stores/queue.ts
+   export const queueStore = writable<QueueItem[]>([]);
+
+   // src/lib/stores/discovery.ts
+   export const discoveredSessions = writable<DiscoveredSession[]>([]);
+
+   // src/lib/stores/requests.ts
+   export const songRequests = writable<SongRequest[]>([]);
+   ```
+
+4. **Create placeholder components** for all screens:
+   - `HomeScreen.svelte` — just a centered layout with "PhaseLock" title and two buttons.
+   - `CreateJam.svelte` — placeholder form.
+   - `SessionBrowser.svelte` — placeholder list.
+   - `HostSession.svelte` — placeholder layout.
+   - `PeerSession.svelte` — placeholder layout.
+   - `NowPlaying.svelte` — placeholder.
+   - `Queue.svelte` — placeholder.
+   - `PeerList.svelte` — placeholder.
+   - `SongRequests.svelte` — placeholder.
+
+   Each should have basic structure but no real functionality yet (that comes in Steps 15–17).
+
+5. **Import the global CSS** in `src/main.ts`:
+   ```typescript
+   import './styles/global.css';
+   ```
+
+### Acceptance Criteria:
+- The app launches with a dark Spotify-inspired theme
+- Global styles include buttons, inputs, cards, typography in the correct color palette
+- Simple screen-based routing works (clicking between screens)
+- All Svelte stores are defined and importable
+- All placeholder components exist and render
+- The app builds and runs with `cargo tauri dev`

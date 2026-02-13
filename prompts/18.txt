@@ -1,0 +1,58 @@
+You are implementing Step 18 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 1–17 are complete (full app is functional).
+
+## Task: Error Handling & Edge Cases
+
+Audit the entire application and implement comprehensive error handling for all scenarios defined in the spec.
+
+### What to do:
+
+1. **Review and implement every error scenario from the error matrix:**
+
+   | Scenario | Required Behavior |
+   |---|---|
+   | **Peer hasn't received file yet** | Play button disabled on host. Tooltip: "Waiting for all peers to receive the file." The playback scheduler must check `FileTransferManager.is_all_ready()` before allowing play. |
+   | **File transfer fails** | Auto-retry up to 3 times (already in Step 8). After 3 failures: emit `error:transfer-failed` event with peer name. Show notification on host: "{peer_name} failed to receive the file. [Retry] [Skip peer]". |
+   | **Peer has no audio output device** | On peer startup / session join, check for audio output via cpal. If none: send a status flag to host with the `JoinRequest` or a separate `PeerStatus` message. Peer sees warning: "No audio output detected — you won't hear playback." Host sees the peer flagged with a ⚠️ icon. |
+   | **Peer disconnects mid-playback** | Already handled in Step 7. Verify: host removes peer, playback continues, mDNS peer count updates, UI updates. |
+   | **Host disconnects/crashes** | Already handled in Step 7. Verify: peers show "Host disconnected — session ended" and return to home screen within 5 seconds (heartbeat timeout). |
+   | **Invalid MP3 file selected** | When host adds a song or peer requests a song: try to decode it first. If `decode_mp3()` fails, show error toast: "Invalid or corrupted MP3 file." Do not add to queue. |
+   | **MP3 decode failure on peer** | If a peer fails to decode a received file: send a `DecodeError { file_id }` message to host. Host is notified: "Peer {name} failed to decode {track}." Host can skip the track. |
+   | **Hash mismatch after transfer** | Already handled in Step 8 (auto-retry). Verify the retry counter and fallback behavior work. |
+   | **Session full (5 peers)** | Already handled in Step 7. Verify the peer sees "Session is full" and is not left in a broken state. |
+   | **UDP clock sync not converging** | If after 5 seconds of pinging, the sliding window has fewer than 3 valid measurements, flag the peer as "sync unstable" (🔴). If the host tries to play and any peer is unstable, show a warning: "Peer {name} has unstable sync. Playback may not be perfectly synchronized." Allow the host to play anyway. |
+   | **Port already in use** | When the host tries to bind TCP/UDP ports: catch the error. Show: "Port 17401 is in use. Please close the other application or change the port." Return to the Create Jam screen. |
+
+2. **Implement a global error boundary in the frontend:**
+   - Listen for `error:general` events globally (in `App.svelte`).
+   - Display errors as toast notifications.
+   - Ensure no unhandled promise rejections from `invoke()` calls — wrap all `invoke()` calls in try/catch or `.catch()`.
+
+3. **Implement graceful shutdown:**
+   - When the app window is closed:
+     - If host: send `SessionEnd` to all peers, unregister mDNS, close all sockets.
+     - If peer: send `LeaveSession` to host, close connections.
+   - Use Tauri's window close event to trigger cleanup.
+
+4. **Validate all user inputs:**
+   - Session name: non-empty, max 50 characters.
+   - Display name: non-empty, max 30 characters.
+   - IP:port for manual connection: validate format (e.g., regex for `ip:port`).
+   - MP3 file: must have `.mp3` extension, must be < 50 MB, must decode successfully.
+
+5. **Implement timeout handling:**
+   - TCP connect timeout: 5 seconds. If connecting to a host takes longer, show "Connection timed out."
+   - File transfer timeout: if no chunks received for 10 seconds, consider the transfer stalled and retry.
+
+6. **Test all error scenarios manually:**
+   - For each row in the error matrix, trigger the condition and verify the correct behavior.
+   - Document any remaining edge cases found during testing.
+
+### Acceptance Criteria:
+- Every error scenario from the spec is handled with appropriate user feedback
+- No unhandled errors or panics in the Rust backend
+- No unhandled promise rejections in the Svelte frontend
+- Graceful shutdown works for both host and peer
+- Input validation prevents invalid data
+- Timeouts prevent the app from hanging indefinitely

@@ -1,0 +1,81 @@
+You are implementing Step 19 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 7, 10, and 11 are complete (session manager, playback scheduler, queue manager).
+
+## Task: Peer Reconnection
+
+Implement the ability for a peer to rejoin an active session after a disconnect and quickly sync up to the current playback state.
+
+### What to do:
+
+1. **Implement the reconnection flow on the peer side:**
+
+   When a peer reconnects to a session (same flow as initial join — enter name, connect to host):
+
+   1. Peer sends `JoinRequest { display_name }` (same as initial join).
+   2. Host recognizes this as a new connection (no special "reconnect" message needed — the host treats it like a fresh join).
+   3. Host sends `JoinAccepted { peer_id, session_state }` where `session_state` includes:
+      - Current queue (with file IDs and statuses).
+      - Current track info: `file_id`, `file_name`, `position_samples`, `sample_rate`, `is_playing`.
+      - List of all file IDs that the peer would need.
+
+2. **File cache on the peer side:**
+
+   Peers should **cache received MP3 files** locally (in memory) for the duration of the app session:
+
+   ```rust
+   pub struct FileCache {
+       files: HashMap<Uuid, Vec<u8>>,  // file_id → raw MP3 bytes
+   }
+
+   impl FileCache {
+       pub fn has(&self, file_id: &Uuid) -> bool;
+       pub fn get(&self, file_id: &Uuid) -> Option<&Vec<u8>>;
+       pub fn insert(&mut self, file_id: Uuid, data: Vec<u8>);
+   }
+   ```
+
+   On reconnect, the peer checks which files from the queue it already has cached.
+
+3. **Implement state sync on the host side:**
+
+   When a peer joins (or rejoins) and the session is mid-playback:
+
+   1. Host sends `JoinAccepted` with full `SessionState` (queue + current track info).
+   2. Host checks which files the peer needs. For MVP, assume the peer needs all files (since we don't have a "I already have these files" message). Transfer all queue files to the peer.
+      - **Optimization (optional):** Add a `FileCacheReport { file_ids: Vec<Uuid> }` message that the peer sends after joining, telling the host which files it already has. The host only transfers missing files.
+   3. Once the current track is transferred and decoded on the peer:
+      - If music is currently playing: the host sends a `PlayCommand` with the **current position** and a near-future target time so the peer can start playing from the right spot.
+      - If music is paused: the host sends the current position so the peer knows where it is, but doesn't start playback.
+
+4. **Handle the "catching up" state on the peer UI:**
+
+   While the peer is syncing after reconnect:
+   - Show a "Syncing..." overlay or status indicator.
+   - Progress: show file transfer progress if files need to be transferred.
+   - Once synced: remove the overlay, peer sees normal session screen.
+
+5. **Handle edge cases:**
+   - Peer reconnects but the session has ended: host doesn't exist anymore, connection fails, peer goes to home screen.
+   - Peer reconnects and a different track is now playing: peer receives the new track file and syncs to it.
+   - Peer reconnects while a track is mid-transfer to other peers: peer joins the transfer as an additional recipient.
+   - Multiple quick disconnects/reconnects: each reconnect is treated independently, no stale state carried over.
+
+6. **Write integration tests:**
+   - Host + peer on loopback. Peer joins, receives a file, host starts playback.
+   - Peer disconnects (simulate TCP drop).
+   - Peer reconnects. Verify:
+     - Peer receives the `SessionState` with current track.
+     - Peer receives the file (or confirms cache hit).
+     - Peer starts playing from the current position.
+   - Test reconnect when music is paused: peer should show the paused state at the correct position.
+   - Test reconnect when the queue has multiple tracks: peer receives all needed files.
+
+### Acceptance Criteria:
+- Peers can rejoin a session after disconnect
+- Reconnected peers receive current session state (queue + playback position)
+- Missing files are transferred to the reconnected peer
+- Peer syncs to the current playback position and starts playing
+- "Syncing..." state is visible in the UI during catch-up
+- File cache avoids re-transferring files the peer already has
+- Integration tests pass

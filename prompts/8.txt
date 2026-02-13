@@ -1,0 +1,96 @@
+You are implementing Step 8 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Step 7 (Session Manager) is complete.
+
+## Task: File Transfer
+
+Implement chunked MP3 file transfer from host to peers (and peer to host for song requests) over TCP, with SHA-256 integrity verification and automatic retry.
+
+### What to do:
+
+1. **Implement the file sender (host → peers)** in `src-tauri/src/transfer/file_transfer.rs`:
+
+   ```rust
+   pub struct FileTransferManager {
+       active_transfers: HashMap<Uuid, TransferState>,
+   }
+
+   struct TransferState {
+       file_id: Uuid,
+       file_name: String,
+       file_data: Vec<u8>,
+       sha256: [u8; 32],
+       peers_pending: HashSet<u32>,   // peer_ids that haven't confirmed yet
+       peers_confirmed: HashSet<u32>,
+       retry_counts: HashMap<u32, u8>,
+   }
+   ```
+
+   Implement:
+   - `start_transfer(file_path, peer_ids, tcp_host)`:
+     1. Read the MP3 file into memory.
+     2. Compute SHA-256 hash of the file data.
+     3. Generate a `Uuid` for the file.
+     4. For each peer, send `FileTransferStart { file_id, file_name, size, sha256 }`.
+     5. Send the file in **64 KB chunks** as `FileChunk { file_id, offset, data }` messages.
+     6. Track which peers are pending confirmation.
+
+   - `handle_file_received(peer_id, file_id, hash_ok)`:
+     1. If `hash_ok`: move peer from `pending` to `confirmed`.
+     2. If `!hash_ok`: increment retry count for that peer. If retries < 3, re-send the file to that peer. If retries >= 3, mark as failed and notify the session manager.
+     3. If all peers confirmed: mark transfer as complete, return the `file_id` so the queue can mark it as "Ready."
+
+   - `is_all_ready(file_id) -> bool`: Check if all peers have confirmed.
+
+2. **Implement the file receiver (peer side):**
+
+   ```rust
+   pub struct FileReceiver {
+       incoming: HashMap<Uuid, IncomingFile>,
+       completed_files: HashMap<Uuid, Vec<u8>>,  // file_id → raw MP3 bytes
+   }
+
+   struct IncomingFile {
+       file_id: Uuid,
+       file_name: String,
+       expected_size: u64,
+       expected_sha256: [u8; 32],
+       data: Vec<u8>,
+       bytes_received: u64,
+   }
+   ```
+
+   Implement:
+   - `handle_transfer_start(msg)`: Create an `IncomingFile` entry, pre-allocate the data vector.
+   - `handle_chunk(msg)`: Append chunk data at the correct offset. Track progress (bytes_received / expected_size) for UI progress bar.
+   - When `bytes_received == expected_size`: compute SHA-256, compare with expected. Send `FileReceived { file_id, hash_ok }` back to host. If hash matches, store in `completed_files` and trigger MP3 decoding.
+   - Provide `get_file(file_id) -> Option<&Vec<u8>>` for the audio engine to access.
+   - Provide `has_file(file_id) -> bool` for reconnection logic.
+
+3. **Implement progress tracking:**
+   - Both sender and receiver should expose transfer progress (0.0–1.0) per file per peer, so the UI can show progress bars.
+   - Emit progress events that the frontend can subscribe to.
+
+4. **Handle edge cases:**
+   - Peer disconnects mid-transfer: cancel that peer's transfer, don't block others.
+   - File is empty or too large (> 50 MB sanity check): reject with error.
+   - Duplicate file_id: ignore (already received).
+
+5. **Write unit tests:**
+   - Chunk a known byte array into 64 KB chunks, reassemble, verify equality.
+   - Compute SHA-256 of known data, verify correctness.
+   - Simulate a hash mismatch, verify retry logic triggers (up to 3 times).
+   - Simulate all peers confirming, verify `is_all_ready` returns true.
+
+6. **Write an integration test:**
+   - Host sends a small MP3 file (or test byte array) to a peer over loopback TCP.
+   - Peer receives all chunks, verifies hash, sends `FileReceived { hash_ok: true }`.
+   - Verify the received data matches the original.
+
+### Acceptance Criteria:
+- Host can transfer an MP3 file to multiple peers over TCP
+- Files are chunked at 64 KB and reassembled correctly
+- SHA-256 integrity verification works
+- Automatic retry on hash mismatch (up to 3 times)
+- Transfer progress is trackable
+- All tests pass

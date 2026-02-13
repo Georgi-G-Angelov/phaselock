@@ -1,0 +1,104 @@
+You are implementing Step 7 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 4–6 are complete (TCP networking, UDP clock sync, mDNS discovery).
+
+## Task: Session Manager
+
+Implement the central session manager that orchestrates creating and joining sessions, managing the peer list, and coordinating between the network, clock sync, and mDNS modules.
+
+### What to do:
+
+1. **Implement the Host session manager** in `src-tauri/src/session/host.rs`:
+
+   ```rust
+   pub struct HostSession {
+       pub session_name: String,
+       pub host_display_name: String,
+       pub peers: Arc<Mutex<HashMap<u32, PeerState>>>,
+       pub tcp_host: TcpHost,
+       pub udp_host: HostClockTracker,
+       pub mdns: MdnsBroadcaster,
+       next_peer_id: AtomicU32,
+       event_tx: mpsc::Sender<SessionEvent>,
+   }
+
+   pub struct PeerState {
+       pub peer_id: u32,
+       pub display_name: String,
+       pub latency_ns: u64,
+       pub files_ready: HashSet<Uuid>,  // file_ids this peer has confirmed receiving
+       pub connected_at: Instant,
+   }
+
+   pub enum SessionEvent {
+       PeerJoined { peer_id: u32, display_name: String },
+       PeerLeft { peer_id: u32 },
+       MessageReceived { peer_id: u32, message: Message },
+   }
+   ```
+
+   The host session manager should:
+   - Start the TCP listener, UDP socket, and mDNS broadcaster.
+   - Handle incoming `JoinRequest` messages:
+     - If peer count < 5: assign a `peer_id`, add to peer list, send `JoinAccepted` with current `SessionState`, broadcast updated peer list to all peers, update mDNS peer count.
+     - If peer count >= 5: send `JoinRejected { reason: "Session is full" }`.
+     - If display name is taken: append a number (e.g., "Alex (2)").
+   - Handle `LeaveSession` messages: remove peer from list, update mDNS, broadcast update.
+   - Handle TCP disconnects (detected by the TCP layer): same as LeaveSession.
+   - Handle `Heartbeat` messages: update last-seen timestamp.
+   - Expose a `shutdown()` method that sends `SessionEnd` to all peers, unregisters mDNS, and closes all connections.
+
+2. **Implement the Peer session manager** in `src-tauri/src/session/peer.rs`:
+
+   ```rust
+   pub struct PeerSession {
+       pub peer_id: u32,
+       pub display_name: String,
+       pub session_name: String,
+       pub host_name: String,
+       pub tcp_peer: TcpPeer,
+       pub clock_sync: ClockSync,
+       pub peers: Vec<PeerInfo>,       // other peers in the session (from host updates)
+       pub event_tx: mpsc::Sender<SessionEvent>,
+   }
+   ```
+
+   The peer session manager should:
+   - Connect to the host via TCP.
+   - Send `JoinRequest { display_name }`.
+   - Wait for `JoinAccepted` or `JoinRejected`.
+   - On accept: store `peer_id`, populate session state (peer list, queue, current track).
+   - Start UDP clock sync pinging.
+   - Handle incoming messages from host and dispatch to appropriate handlers (file transfers, playback commands, queue updates).
+   - Handle host disconnection: detect TCP disconnect or heartbeat timeout, emit a `HostDisconnected` event.
+   - Expose a `leave()` method that sends `LeaveSession` and closes connections.
+
+3. **Implement the session coordinator** in `src-tauri/src/session/mod.rs`:
+
+   A top-level enum/struct that holds either a `HostSession` or `PeerSession`:
+
+   ```rust
+   pub enum Session {
+       Host(HostSession),
+       Peer(PeerSession),
+       None,
+   }
+   ```
+
+   This is the single point of access for the rest of the app (Tauri commands will interact with this).
+
+4. **Write integration tests:**
+   - Create a HostSession on loopback. Create a PeerSession that joins. Verify handshake completes, peer appears in host's peer list.
+   - Join with a duplicate display name. Verify the name is modified (e.g., "Alex" → "Alex (2)").
+   - Join 5 peers. Attempt a 6th. Verify rejection.
+   - Peer leaves voluntarily. Verify host removes them and mDNS peer count updates.
+   - Host shuts down. Verify peer receives SessionEnd.
+
+### Acceptance Criteria:
+- Host can create a fully functioning session (TCP + UDP + mDNS)
+- Peers can discover, join, and leave sessions
+- Peer list is correctly maintained and broadcast to all peers
+- Duplicate names are handled
+- Session full rejection works
+- Host shutdown cleanly terminates all connections
+- All integration tests pass

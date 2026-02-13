@@ -1,0 +1,127 @@
+You are implementing Step 2 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Step 1 (Project Scaffolding) is complete. The Tauri 2 + Svelte project builds and runs.
+
+## Task: Message Protocol & Serialization
+
+Define all network message types used by PhaseLock and implement length-prefixed binary serialization/deserialization.
+
+### What to do:
+
+1. **Implement all message types** in `src-tauri/src/network/messages.rs`:
+
+   Define a top-level enum with serde Serialize/Deserialize:
+
+   ```rust
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub enum Message {
+       // Session management
+       JoinRequest { display_name: String },
+       JoinAccepted { peer_id: u32, session_state: SessionState },
+       JoinRejected { reason: String },
+       LeaveSession { peer_id: u32 },
+       SessionEnd,
+       Heartbeat,
+
+       // File transfer
+       FileTransferStart { file_id: Uuid, file_name: String, size: u64, sha256: [u8; 32] },
+       FileChunk { file_id: Uuid, offset: u64, data: Vec<u8> },
+       FileReceived { file_id: Uuid, hash_ok: bool },
+
+       // Song requests
+       SongRequest { file_name: String, file_size: u64 },
+       SongRequestAccepted { request_id: Uuid },
+       SongRequestRejected { request_id: Uuid },
+       SongUploadChunk { request_id: Uuid, offset: u64, data: Vec<u8> },
+       SongUploadComplete { request_id: Uuid, sha256: [u8; 32] },
+
+       // Playback control
+       PlayCommand { file_id: Uuid, position_samples: u64, target_time_ns: u64 },
+       PauseCommand { position_samples: u64 },
+       ResumeCommand { position_samples: u64, target_time_ns: u64 },
+       StopCommand,
+       SeekCommand { position_samples: u64, target_time_ns: u64 },
+
+       // Queue sync
+       QueueUpdate { queue: Vec<QueueItem> },
+   }
+   ```
+
+2. **Define supporting structs:**
+
+   ```rust
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub struct SessionState {
+       pub session_name: String,
+       pub host_name: String,
+       pub peers: Vec<PeerInfo>,
+       pub queue: Vec<QueueItem>,
+       pub current_track: Option<CurrentTrack>,
+   }
+
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub struct PeerInfo {
+       pub peer_id: u32,
+       pub display_name: String,
+   }
+
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub struct QueueItem {
+       pub id: Uuid,
+       pub file_name: String,
+       pub duration_secs: f64,
+       pub added_by: String,
+       pub status: QueueItemStatus,
+   }
+
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub enum QueueItemStatus {
+       Transferring,
+       Ready,
+       Playing,
+       Played,
+   }
+
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub struct CurrentTrack {
+       pub file_id: Uuid,
+       pub file_name: String,
+       pub position_samples: u64,
+       pub sample_rate: u32,
+       pub is_playing: bool,
+   }
+   ```
+
+3. **Define UDP clock sync messages** (separate from TCP messages, as they use a different transport):
+
+   ```rust
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   pub enum ClockMessage {
+       ClockPing { peer_id: u32, peer_send_time_ns: u64 },
+       ClockPong { peer_id: u32, peer_send_time_ns: u64, host_recv_time_ns: u64, host_send_time_ns: u64 },
+   }
+   ```
+
+4. **Implement message framing** — a helper module for reading/writing length-prefixed messages over TCP:
+
+   ```rust
+   // Wire format: [length: u32 LE][bincode payload]
+   pub async fn write_message<W: AsyncWrite + Unpin>(writer: &mut W, msg: &Message) -> Result<()>;
+   pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message>;
+   ```
+
+   - Serialize with `bincode::serialize()`
+   - Prefix with `payload.len() as u32` in little-endian
+   - On read: read 4 bytes → parse length → read exactly that many bytes → `bincode::deserialize()`
+
+5. **Write unit tests** for round-trip serialization:
+   - Serialize and deserialize every `Message` variant. Verify equality.
+   - Serialize and deserialize every `ClockMessage` variant. Verify equality.
+   - Test the framing: write a message to a buffer, read it back, verify it matches.
+   - Test with edge cases: empty strings, zero-length data vectors, max u64 values.
+
+### Acceptance Criteria:
+- All message types compile and derive Serialize/Deserialize
+- `write_message` / `read_message` work correctly with an in-memory buffer
+- All unit tests pass
+- `cargo test` succeeds

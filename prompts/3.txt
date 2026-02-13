@@ -1,0 +1,53 @@
+You are implementing Step 3 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Step 1 (Project Scaffolding) is complete.
+
+## Task: Logging Module
+
+Implement a buffered file logger with rotation for PhaseLock.
+
+### What to do:
+
+1. **Implement the logger** in `src-tauri/src/logging/logger.rs`:
+
+   The logger must:
+   - Implement the `log::Log` trait so it integrates with Rust's `log` crate (i.e., `log::info!()`, `log::error!()`, etc. work throughout the app).
+   - Buffer log entries in an **in-memory `VecDeque<String>`**.
+   - Flush the buffer to disk **every 50 entries**, or **immediately on any `ERROR`-level log**.
+   - Log file path: `<app_data_dir>/phaselock/phaselock.log` (use Tauri's `app_data_dir` or a configurable path).
+   - Each log line format: `[YYYY-MM-DD HH:MM:SS.mmm] [LEVEL] [module] message`
+   - **Rotation:** Before each flush, check the file size. If the file exceeds **20 MB**, truncate approximately the first 25% of the file to make room (read the file, drop the first ~25% of lines, rewrite).
+   - Default log level: `INFO`. Configurable via `PHASELOCK_LOG` environment variable (e.g., `PHASELOCK_LOG=debug`).
+
+2. **Create a public init function:**
+
+   ```rust
+   pub fn init_logger(log_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>>;
+   ```
+
+   This should:
+   - Create the log directory if it doesn't exist.
+   - Initialize the custom logger and set it as the global `log` logger.
+   - Parse `PHASELOCK_LOG` env var for the log level filter.
+
+3. **Thread safety:**
+   - The logger will be called from multiple threads (network, audio, session).
+   - Use `parking_lot::Mutex` to protect the internal buffer and file handle.
+   - The flush operation must not block logging from other threads for long — keep the critical section short (swap the buffer out, release the lock, then write to disk).
+
+4. **Wire it up in `main.rs`:**
+   - Call `init_logger()` early in the Tauri setup, before any other modules initialize.
+   - Add a few test log lines: `log::info!("PhaseLock starting up");`
+
+5. **Write unit tests:**
+   - Test that logs are buffered and not written to disk until 50 entries accumulate.
+   - Test that an ERROR log triggers an immediate flush.
+   - Test that the log file is truncated when it exceeds 20 MB (you can simulate this with a smaller threshold in tests).
+   - Test log line format parsing.
+
+### Acceptance Criteria:
+- `log::info!()`, `log::error!()`, etc. work throughout the Rust backend
+- Logs appear in `<app_data_dir>/phaselock/phaselock.log` with correct format
+- Buffer flushes every 50 entries or immediately on ERROR
+- File rotation kicks in at 20 MB
+- All unit tests pass

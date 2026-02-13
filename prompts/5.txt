@@ -1,0 +1,101 @@
+You are implementing Step 5 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 1–3 are complete (project scaffolding, message protocol, logging).
+
+## Task: UDP Networking & Clock Synchronization
+
+Implement the UDP socket layer and the NTP-style clock synchronization algorithm that keeps all peers' clocks aligned with the host's clock.
+
+### What to do:
+
+1. **Implement the UDP socket layer** in `src-tauri/src/network/udp.rs`:
+
+   - **Host side:** Bind a `tokio::net::UdpSocket` on port `17402` (configurable). Listen for incoming `ClockPing` messages. For each ping, immediately respond with a `ClockPong`.
+   - **Peer side:** Bind a UDP socket on any available port. Send `ClockPing` messages to the host every **200 ms**. Listen for `ClockPong` responses.
+   - Serialize/deserialize `ClockMessage` using bincode (no length prefix needed for UDP — each datagram is one message).
+   - Messages are defined in Step 2:
+     ```rust
+     ClockPing { peer_id: u32, peer_send_time_ns: u64 }
+     ClockPong { peer_id: u32, peer_send_time_ns: u64, host_recv_time_ns: u64, host_send_time_ns: u64 }
+     ```
+
+2. **Implement the clock sync algorithm** in `src-tauri/src/sync/clock.rs`:
+
+   On the **peer side**, after receiving each `ClockPong`:
+
+   ```
+   peer_recv_time = now() in nanoseconds (monotonic clock)
+
+   RTT = (peer_recv_time - peer_send_time) - (host_send_time - host_recv_time)
+   offset = ((host_recv_time - peer_send_time) + (host_send_time - peer_recv_time)) / 2
+   ```
+
+   - Maintain a **sliding window** of the last **10 measurements** (RTT + offset pairs).
+   - Discard any measurement older than **2 seconds** (stale threshold).
+   - The current best offset estimate = **median of the offsets** in the window (robust against outliers).
+   - The current estimated one-way latency = **median RTT / 2**.
+   - Use `std::time::Instant` for the monotonic clock. Convert to nanoseconds with `.elapsed().as_nanos()` or track a base instant.
+
+   ```rust
+   pub struct ClockSync {
+       window: VecDeque<ClockMeasurement>,
+       pub current_offset_ns: i64,     // peer clock - host clock
+       pub current_latency_ns: u64,    // estimated one-way latency
+   }
+
+   struct ClockMeasurement {
+       timestamp: Instant,
+       rtt_ns: u64,
+       offset_ns: i64,
+   }
+   ```
+
+3. **Host-side latency tracking:**
+
+   The host must also maintain a **per-peer latency map**:
+
+   ```rust
+   pub struct HostClockTracker {
+       peer_latencies: HashMap<u32, PeerLatency>,
+   }
+
+   pub struct PeerLatency {
+       pub estimated_one_way_ns: u64,
+       pub last_updated: Instant,
+   }
+   ```
+
+   - When the host receives a `ClockPing` and sends a `ClockPong`, it computes `RTT / 2` using the timestamps and stores it in the map.
+   - This map is used later (Step 10) for staggered command dispatch.
+
+4. **Provide a method to convert between host time and peer time:**
+
+   ```rust
+   impl ClockSync {
+       /// Convert a host-clock timestamp to this peer's local clock
+       pub fn host_to_local(&self, host_time_ns: u64) -> u64;
+
+       /// Convert this peer's local clock timestamp to host clock
+       pub fn local_to_host(&self, local_time_ns: u64) -> u64;
+   }
+   ```
+
+5. **Write unit tests:**
+   - Test offset calculation with known values (simulated timestamps).
+   - Test sliding window median with 10 measurements, verify median is correct.
+   - Test that stale measurements (> 2s) are discarded.
+   - Test with outlier values — verify median filters them out.
+   - Test `host_to_local` and `local_to_host` conversions are inverses.
+
+6. **Write an integration test:**
+   - Start host UDP socket and peer UDP socket on loopback.
+   - Let the peer ping for 3 seconds (15 pings).
+   - Verify the computed offset converges to near-zero (since both are on the same machine, offset should be ~0).
+   - Verify the RTT is very low (< 1 ms on loopback).
+
+### Acceptance Criteria:
+- UDP ping/pong runs at 200 ms intervals
+- Clock offset converges within 2 seconds on loopback
+- Median filter correctly handles outliers
+- Host maintains per-peer latency map
+- All unit and integration tests pass

@@ -1,0 +1,98 @@
+You are implementing Step 6 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Step 1 (Project Scaffolding) is complete.
+
+## Task: mDNS Session Discovery
+
+Implement mDNS-based zero-configuration LAN session discovery using the `mdns-sd` crate. The host advertises its session, and peers browse for available sessions.
+
+### What to do:
+
+1. **Implement mDNS broadcasting (host side)** in `src-tauri/src/network/mdns.rs`:
+
+   When the host creates a session, register an mDNS service:
+
+   ```rust
+   pub struct MdnsBroadcaster {
+       daemon: ServiceDaemon,
+       service_fullname: String,
+   }
+
+   impl MdnsBroadcaster {
+       /// Register the session on the network
+       pub fn register(
+           session_name: &str,
+           host_display_name: &str,
+           port: u16,
+           peer_count: u8,
+           max_peers: u8,
+       ) -> Result<Self>;
+
+       /// Update the peer count in the TXT record (call when peers join/leave)
+       pub fn update_peer_count(&self, count: u8) -> Result<()>;
+
+       /// Unregister the service (call when session ends)
+       pub fn unregister(self) -> Result<()>;
+   }
+   ```
+
+   - Service type: `_phaselock._tcp.local.`
+   - Service name: the session name (e.g., `Friday Night Vibes._phaselock._tcp.local.`)
+   - Port: the TCP port the host is listening on (default 17401)
+   - TXT records:
+     - `name=<session_name>`
+     - `host=<host_display_name>`
+     - `peers=<current_count>`
+     - `max_peers=5`
+
+2. **Implement mDNS browsing (peer side):**
+
+   ```rust
+   pub struct MdnsBrowser {
+       daemon: ServiceDaemon,
+       receiver: Receiver<ServiceEvent>,
+   }
+
+   #[derive(Debug, Clone)]
+   pub struct DiscoveredSession {
+       pub session_name: String,
+       pub host_name: String,
+       pub address: SocketAddr,
+       pub peer_count: u8,
+       pub max_peers: u8,
+   }
+
+   impl MdnsBrowser {
+       /// Start browsing for PhaseLock sessions on the local network
+       pub fn start() -> Result<Self>;
+
+       /// Get currently discovered sessions (call periodically or on event)
+       pub fn get_sessions(&self) -> Vec<DiscoveredSession>;
+
+       /// Stop browsing
+       pub fn stop(self) -> Result<()>;
+   }
+   ```
+
+   - Browse for `_phaselock._tcp.local.` services.
+   - Parse TXT records to extract session name, host name, peer count, max peers.
+   - Resolve the service to get the IP address and port.
+   - Maintain a list of currently visible sessions. Remove sessions that are unregistered or become unreachable.
+
+3. **Handle edge cases:**
+   - Multiple sessions on the same network — list all of them.
+   - Session name conflicts — append a suffix if needed, or just allow duplicates (different IPs distinguish them).
+   - Service goes away — remove from the discovered list when an mDNS "removed" event fires.
+
+4. **Write integration tests:**
+   - Register a service, browse for it on the same machine, verify it appears in the discovered list.
+   - Verify TXT records are correctly parsed (session name, host name, peer count).
+   - Unregister the service, verify it disappears from the discovered list.
+   - Register two services, verify both appear.
+
+### Acceptance Criteria:
+- Host can advertise a session via mDNS with all required metadata
+- Peer can discover sessions on the local network
+- Discovered sessions include session name, host name, IP:port, and peer count
+- Sessions disappear from the list when unregistered
+- Integration tests pass on loopback/localhost

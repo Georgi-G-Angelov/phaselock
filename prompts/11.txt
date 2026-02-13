@@ -1,0 +1,110 @@
+You are implementing Step 11 of the PhaseLock application — a cross-platform desktop app for synchronized music playback.
+
+**Prerequisites:** Steps 8 and 10 are complete (file transfer, playback scheduler).
+
+## Task: Queue Manager
+
+Implement the playback queue that manages the ordered list of songs, handles auto-advance, pre-distribution of the next track, and syncs queue state to all peers.
+
+### What to do:
+
+1. **Implement the queue manager** in `src-tauri/src/queue/manager.rs`:
+
+   ```rust
+   pub struct QueueManager {
+       queue: Vec<QueueItem>,
+       current_index: Option<usize>,  // index of the currently playing track
+   }
+
+   // QueueItem is already defined in messages.rs (Step 2):
+   // { id: Uuid, file_name: String, duration_secs: f64, added_by: String, status: QueueItemStatus }
+   ```
+
+   Implement these methods:
+
+   ```rust
+   impl QueueManager {
+       pub fn new() -> Self;
+
+       /// Add a track to the end of the queue
+       pub fn add(&mut self, file_name: String, duration_secs: f64, added_by: String) -> Uuid;
+
+       /// Remove a track by id. Returns true if found and removed.
+       pub fn remove(&mut self, id: Uuid) -> bool;
+
+       /// Move a track from one position to another (drag-and-drop reorder)
+       pub fn reorder(&mut self, from_index: usize, to_index: usize) -> bool;
+
+       /// Get the current queue as a Vec<QueueItem> (for broadcasting to peers)
+       pub fn get_queue(&self) -> Vec<QueueItem>;
+
+       /// Get the currently playing track
+       pub fn current(&self) -> Option<&QueueItem>;
+
+       /// Mark a track as Ready (all peers have the file)
+       pub fn mark_ready(&mut self, id: Uuid);
+
+       /// Mark a track as Playing
+       pub fn mark_playing(&mut self, id: Uuid);
+
+       /// Mark a track as Played (finished)
+       pub fn mark_played(&mut self, id: Uuid);
+
+       /// Advance to the next track. Returns the next QueueItem if available and Ready.
+       pub fn advance(&mut self) -> Option<&QueueItem>;
+
+       /// Get the next track in the queue (for pre-distribution), without advancing
+       pub fn peek_next(&self) -> Option<&QueueItem>;
+
+       /// Skip the current track and advance
+       pub fn skip(&mut self) -> Option<&QueueItem>;
+
+       /// Check if all peers have the file for a given track
+       pub fn is_ready(&self, id: Uuid) -> bool;
+   }
+   ```
+
+2. **Integrate with the session manager (host side):**
+
+   When the host performs queue operations:
+   - **Add song:** Host picks a file → file is decoded locally to get duration → `queue.add()` called → file transfer initiated to all peers → when all confirm → `queue.mark_ready()`.
+   - **Remove / Reorder:** Modify the queue → broadcast `QueueUpdate` to all peers.
+   - **Auto-advance:** When the audio engine signals "track finished":
+     1. Mark current track as `Played`.
+     2. Call `queue.advance()`.
+     3. If next track is `Ready`: initiate synchronized playback via the scheduler.
+     4. If next track is `Transferring`: wait for transfer to complete, then play.
+     5. If no next track: stop playback.
+   - **Skip:** Same as auto-advance but triggered by host pressing Skip.
+
+3. **Pre-distribution of the next track:**
+
+   Whenever the current track starts playing:
+   - Call `queue.peek_next()` to see what's next.
+   - If the next track's status is not yet `Ready`, begin transferring it to all peers.
+   - This ensures zero gap between songs.
+
+   Also trigger pre-distribution when:
+   - A new song is added to position "next up" in the queue.
+   - The queue is reordered and the "next up" track changes.
+
+4. **Queue sync to peers:**
+
+   After every mutation (add, remove, reorder, status change), broadcast `QueueUpdate { queue }` to all connected peers via TCP. Peers replace their local queue state entirely (server-authoritative model).
+
+5. **Write unit tests:**
+   - Add 3 songs, verify queue order.
+   - Remove the middle song, verify order is correct.
+   - Reorder: move song from index 2 to index 0, verify new order.
+   - Advance: mark song 1 as Playing, mark as Played, advance → song 2 becomes current.
+   - Auto-advance with no next track: returns None.
+   - Skip: skips current, returns next.
+   - Peek next: returns the song after current without modifying state.
+   - Edge cases: empty queue, single item queue, remove currently playing track.
+
+### Acceptance Criteria:
+- Queue supports add, remove, reorder, advance, skip, peek
+- Auto-advance works when a track finishes
+- Pre-distribution of the next track is triggered at the right times
+- QueueUpdate is broadcast to all peers after every mutation
+- All unit tests pass
