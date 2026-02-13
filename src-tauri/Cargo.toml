@@ -23,7 +23,11 @@ cpal = "0.15"
 symphonia = { version = "0.5", features = ["mp3"] }
 mdns-sd = "0.11"
 chrono = "0.4"
-log = "0.4"
+log = { version = "0.4", features = ["std"] }
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"

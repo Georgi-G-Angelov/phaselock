@@ -2705,6 +2705,7 @@ dependencies = [
  "bincode",
  "chrono",
  "cpal",
+ "dirs",
  "log",
  "mdns-sd",
  "parking_lot",
@@ -2715,6 +2716,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tempfile",
  "tokio",
  "uuid",
 ]
