@@ -263,6 +263,15 @@ h4 {
     cursor: not-allowed;
 }
 
+.input-error {
+    border-color: var(--error-red);
+}
+
+.input-error:focus {
+    border-color: var(--error-red);
+    box-shadow: 0 0 0 1px var(--error-red);
+}
+
 .input-label {
     display: block;
     margin-bottom: 0.375rem;

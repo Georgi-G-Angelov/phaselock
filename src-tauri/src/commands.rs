@@ -173,6 +173,22 @@ pub async fn create_session(
     session_name: String,
     display_name: String,
 ) -> Result<SessionInfoPayload, String> {
+    // Input validation
+    let session_name = session_name.trim().to_string();
+    let display_name = display_name.trim().to_string();
+    if session_name.is_empty() {
+        return Err("Session name cannot be empty.".into());
+    }
+    if session_name.len() > 50 {
+        return Err("Session name must be 50 characters or fewer.".into());
+    }
+    if display_name.is_empty() {
+        return Err("Display name cannot be empty.".into());
+    }
+    if display_name.len() > 30 {
+        return Err("Display name must be 30 characters or fewer.".into());
+    }
+
     let state = app.state::<AppState>();
     let mut session = state.session.lock().await;
 
@@ -224,8 +240,13 @@ pub async fn create_session(
             Ok(info)
         }
         Err(e) => {
-            log::error!("Failed to create session: {e}");
-            Err(format!("Failed to create session: {e}"))
+            let msg = e.to_string();
+            log::error!("Failed to create session: {msg}");
+            if msg.contains("address already in use") || msg.contains("AddrInUse") || msg.contains("Address already in use") {
+                Err("Port 17401 is already in use. Please close the other application or try again.".into())
+            } else {
+                Err(format!("Failed to create session: {msg}"))
+            }
         }
     }
 }
@@ -236,6 +257,19 @@ pub async fn join_session(
     address: String,
     display_name: String,
 ) -> Result<SessionInfoPayload, String> {
+    // Input validation
+    let display_name = display_name.trim().to_string();
+    if display_name.is_empty() {
+        return Err("Display name cannot be empty.".into());
+    }
+    if display_name.len() > 30 {
+        return Err("Display name must be 30 characters or fewer.".into());
+    }
+    let address = address.trim().to_string();
+    if address.is_empty() {
+        return Err("Address cannot be empty.".into());
+    }
+
     let state = app.state::<AppState>();
     let mut session = state.session.lock().await;
 
@@ -292,8 +326,17 @@ pub async fn join_session(
             Ok(info)
         }
         Err(e) => {
-            log::error!("Failed to join session: {e}");
-            Err(format!("Failed to join session: {e}"))
+            let msg = e.to_string();
+            log::error!("Failed to join session: {msg}");
+            if msg.contains("timed out") || msg.contains("Timeout") {
+                Err("Connection timed out. Make sure the host is running and reachable.".into())
+            } else if msg.contains("Connection refused") || msg.contains("refused") {
+                Err("Connection refused. Make sure the host is running on the specified address.".into())
+            } else if msg.contains("full") {
+                Err("Session is full. The host has reached the maximum number of peers.".into())
+            } else {
+                Err(format!("Failed to join session: {msg}"))
+            }
         }
     }
 }
@@ -479,14 +522,26 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
                 .to_string_lossy()
                 .to_string();
 
-            // Read the file and decode to get duration.
+            // Validate file extension
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !ext.eq_ignore_ascii_case("mp3") {
+                return Err("Only .mp3 files are supported.".into());
+            }
+
+            // Read the file and validate size
             let file_data = tokio::fs::read(&file_path)
                 .await
                 .map_err(|e| format!("Failed to read file: {e}"))?;
 
+            const MAX_FILE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
+            if file_data.len() > MAX_FILE_SIZE {
+                return Err("File is too large. Maximum size is 50 MB.".into());
+            }
+
+            // Validate MP3 by trying to decode
             let duration_secs = match crate::audio::decoder::decode_mp3(&file_data) {
                 Ok(decoded) => decoded.duration_secs,
-                Err(e) => return Err(format!("Failed to decode MP3: {e:?}")),
+                Err(_e) => return Err("Invalid or corrupted MP3 file.".into()),
             };
 
             let mut queue = state.queue.lock().await;
@@ -571,9 +626,20 @@ pub async fn request_song(app: AppHandle, file_path: String) -> Result<(), Strin
                 .to_string_lossy()
                 .to_string();
 
+            // Validate file extension
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !ext.eq_ignore_ascii_case("mp3") {
+                return Err("Only .mp3 files are supported.".into());
+            }
+
             let metadata = tokio::fs::metadata(&file_path)
                 .await
                 .map_err(|e| format!("Failed to read file metadata: {e}"))?;
+
+            const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
+            if metadata.len() > MAX_FILE_SIZE {
+                return Err("File is too large. Maximum size is 50 MB.".into());
+            }
 
             let msg = Message::SongRequest {
                 file_name,

@@ -13,7 +13,12 @@
     let loading = false;
     let toast: Toast;
 
-    $: canSubmit = sessionName.trim().length > 0 && displayName.trim().length > 0 && !loading;
+    $: sessionNameTrimmed = sessionName.trim();
+    $: displayNameTrimmed = displayName.trim();
+    $: sessionNameError = sessionNameTrimmed.length > 50 ? 'Max 50 characters' : '';
+    $: displayNameError = displayNameTrimmed.length > 30 ? 'Max 30 characters' : '';
+    $: canSubmit = sessionNameTrimmed.length > 0 && displayNameTrimmed.length > 0
+        && !sessionNameError && !displayNameError && !loading;
 
     async function handleCreate() {
         if (!canSubmit) return;
@@ -60,7 +65,13 @@
                     bind:value={sessionName}
                     on:keydown={handleKeydown}
                     disabled={loading}
+                    maxlength="50"
                 />
+                {#if sessionNameError}
+                    <span class="text-xs" style="color: var(--error-red)">{sessionNameError}</span>
+                {:else if sessionNameTrimmed.length > 0}
+                    <span class="text-xs text-secondary">{sessionNameTrimmed.length}/50</span>
+                {/if}
             </div>
 
             <div class="input-group">
@@ -73,7 +84,13 @@
                     bind:value={displayName}
                     on:keydown={handleKeydown}
                     disabled={loading}
+                    maxlength="30"
                 />
+                {#if displayNameError}
+                    <span class="text-xs" style="color: var(--error-red)">{displayNameError}</span>
+                {:else if displayNameTrimmed.length > 0}
+                    <span class="text-xs text-secondary">{displayNameTrimmed.length}/30</span>
+                {/if}
             </div>
 
             <button

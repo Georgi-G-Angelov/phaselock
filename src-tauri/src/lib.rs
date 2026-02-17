@@ -25,6 +25,28 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                use tauri::Manager;
+                let app = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app.state::<AppState>();
+                    let mut session = state.session.lock().await;
+                    if session.is_active() {
+                        log::info!("Window closing — shutting down active session");
+                        session.shutdown().await;
+                    }
+                    // Stop mDNS browser if running.
+                    let mut browser = state.mdns_browser.lock().await;
+                    if let Some(b) = browser.take() {
+                        let _ = b.stop();
+                    }
+                    // Stop position ticker.
+                    commands::stop_position_ticker(&state).await;
+                    log::info!("Graceful shutdown complete");
+                });
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::create_session,
             commands::join_session,

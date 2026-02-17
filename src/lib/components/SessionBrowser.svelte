@@ -18,6 +18,12 @@
     let loadingAddress = '';
     let toast: Toast;
 
+    // IP:port validation regex
+    const IP_PORT_REGEX = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})$/;
+    $: manualAddressValid = manualAddress.trim() === '' || IP_PORT_REGEX.test(manualAddress.trim());
+    $: displayNameTrimmed = displayName.trim();
+    $: displayNameError = displayNameTrimmed.length > 30 ? 'Max 30 characters' : '';
+
     let pollTimer: ReturnType<typeof setInterval> | null = null;
     let unlistenDiscovery: UnlistenFn | null = null;
 
@@ -77,6 +83,10 @@
     function handleManualConnect() {
         const addr = manualAddress.trim();
         if (!addr) return;
+        if (!IP_PORT_REGEX.test(addr)) {
+            toast?.show('Invalid format. Use IP:port (e.g., 192.168.1.42:17401)', 'error');
+            return;
+        }
         joinSession(addr);
     }
 
@@ -106,7 +116,13 @@
                 placeholder="e.g., Alex"
                 bind:value={displayName}
                 disabled={loading}
+                maxlength="30"
             />
+            {#if displayNameError}
+                <span class="text-xs" style="color: var(--error-red)">{displayNameError}</span>
+            {:else if displayNameTrimmed.length > 0}
+                <span class="text-xs text-secondary">{displayNameTrimmed.length}/30</span>
+            {/if}
         </div>
 
         <!-- Discovered sessions -->
@@ -153,6 +169,7 @@
         <div class="flex gap-2">
             <input
                 class="input flex-1"
+                class:input-error={manualAddress.trim() !== '' && !manualAddressValid}
                 type="text"
                 placeholder="192.168.1.42:17401"
                 bind:value={manualAddress}
@@ -162,7 +179,7 @@
             <button
                 class="btn btn-secondary"
                 on:click={handleManualConnect}
-                disabled={loading || !manualAddress.trim()}
+                disabled={loading || !manualAddress.trim() || !manualAddressValid || !!displayNameError}
             >
                 {#if loading && loadingAddress === manualAddress.trim()}
                     <Spinner size={16} />
