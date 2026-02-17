@@ -4,8 +4,35 @@
     import { queueStore } from '../stores/queue';
     import Spinner from './Spinner.svelte';
 
+    import { createEventDispatcher } from 'svelte';
+
     /** Whether the queue is editable (host only). */
     export let editable: boolean = false;
+
+    /** Whether to show the Request Song button (peer only). */
+    export let showRequestButton: boolean = false;
+
+    const dispatch = createEventDispatcher<{ 'toast-message': { message: string; variant: 'success' | 'error' | 'info' } }>();
+
+    let requestPending = false;
+
+    async function requestSong() {
+        const selected = await open({
+            multiple: false,
+            filters: [{ name: 'Audio', extensions: ['mp3'] }],
+        });
+        if (selected) {
+            requestPending = true;
+            try {
+                await invoke('request_song', { filePath: selected });
+                dispatch('toast-message', { message: 'Song request sent!', variant: 'success' });
+            } catch (e) {
+                dispatch('toast-message', { message: `Request failed: ${e}`, variant: 'error' });
+            } finally {
+                requestPending = false;
+            }
+        }
+    }
 
     let dragIndex: number | null = null;
     let dropIndex: number | null = null;
@@ -141,6 +168,19 @@
                     {/if}
                 </div>
             {/each}
+        </div>
+    {/if}
+
+    {#if showRequestButton}
+        <div class="request-section" style="margin-top: auto; padding-top: 0.75rem; border-top: 1px solid var(--border-subtle);">
+            <button
+                class="btn btn-primary"
+                style="width: 100%;"
+                on:click={requestSong}
+                disabled={requestPending}
+            >
+                {requestPending ? 'Request pending...' : '🎵 Request Song'}
+            </button>
         </div>
     {/if}
 </div>

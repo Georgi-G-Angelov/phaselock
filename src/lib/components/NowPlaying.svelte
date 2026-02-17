@@ -43,7 +43,7 @@
     <h4>Now Playing</h4>
 
     {#if !hasTrack && $playbackStore.state === 'stopped'}
-        <p class="text-secondary text-sm">No track playing</p>
+        <p class="text-secondary text-sm">{hostControls ? 'No track playing' : 'Waiting for host to play a track...'}</p>
     {:else}
         <div class="track-info flex-col gap-1">
             <span class="track-name text-ellipsis">{$playbackStore.file_name || 'Unknown'}</span>
