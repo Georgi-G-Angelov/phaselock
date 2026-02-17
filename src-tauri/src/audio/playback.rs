@@ -119,6 +119,13 @@ pub struct AudioOutput {
     device_channels: u16,
 }
 
+// SAFETY: AudioOutput is only held behind a Mutex and never actually moved
+// between threads. The `Stream` is `!Send` due to a PhantomData marker in cpal,
+// but the actual platform stream handle is thread-safe on all supported
+// platforms (WASAPI, CoreAudio, ALSA). We only keep `_stream` alive to prevent
+// it from being dropped (which would stop the audio callback).
+unsafe impl Send for AudioOutput {}
+
 impl AudioOutput {
     /// Initialize audio output using the default device.
     pub fn new() -> Result<Self, PlaybackError> {

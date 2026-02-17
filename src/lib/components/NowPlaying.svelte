@@ -13,6 +13,7 @@
         ? ($playbackStore.position_ms / $playbackStore.duration_ms) * 100
         : 0;
     $: anyTransferring = $queueStore.some(q => q.status === 'Transferring');
+    $: hasReadyTracks = $queueStore.some(q => q.status === 'Ready');
 
     function formatTime(ms: number): string {
         const totalSec = Math.floor(ms / 1000);
@@ -79,7 +80,7 @@
                     class="btn-icon large"
                     aria-label={isPlaying ? 'Pause' : 'Play'}
                     on:click={togglePlay}
-                    disabled={!hasTrack || anyTransferring}
+                    disabled={(!hasTrack && !hasReadyTracks) || anyTransferring}
                     title={anyTransferring ? 'Waiting for all peers to receive the file' : ''}
                 >
                     {isPlaying ? '⏸' : '▶'}

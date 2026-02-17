@@ -1,3 +1,4 @@
+use crate::audio::playback::AudioOutput;
 use crate::network::mdns::{DiscoveredSession, MdnsBrowser};
 use crate::network::messages::{CurrentTrack, QueueItem};
 use crate::queue::manager::QueueManager;
@@ -6,6 +7,7 @@ use crate::transfer::file_cache::FileCache;
 use crate::transfer::song_request::SongRequestManager;
 use parking_lot::Mutex as ParkingMutex;
 use serde::Serialize;
+use std::collections::HashMap;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -132,6 +134,10 @@ pub struct AppState {
     pub host_queue_state: std::sync::Arc<ParkingMutex<Vec<QueueItem>>>,
     /// Host-side shared current track state (for session broadcasts).
     pub host_current_track: std::sync::Arc<ParkingMutex<Option<CurrentTrack>>>,
+    /// Audio output engine (created lazily on first play).
+    pub audio_output: Mutex<Option<AudioOutput>>,
+    /// Raw file bytes for each queued track (keyed by track UUID).
+    pub track_data: Mutex<HashMap<Uuid, Vec<u8>>>,
 }
 
 impl AppState {
@@ -146,6 +152,8 @@ impl AppState {
             file_cache: Mutex::new(FileCache::new()),
             host_queue_state: std::sync::Arc::new(ParkingMutex::new(Vec::new())),
             host_current_track: std::sync::Arc::new(ParkingMutex::new(None)),
+            audio_output: Mutex::new(None),
+            track_data: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -457,22 +465,121 @@ pub async fn play(app: AppHandle) -> Result<(), String> {
 
     match &*session {
         Session::Host(_host) => {
-            // In a full implementation this would trigger the PlaybackScheduler.
-            // For now, emit a state change event.
+            drop(session);
+            play_current_track(&app, &state).await
+        }
+        _ => Err("Only the host can control playback.".into()),
+    }
+}
+
+/// Internal helper: advance the queue if needed, decode the current track,
+/// load it into AudioOutput, and start playback.
+async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    let mut queue = state.queue.lock().await;
+
+    // If there is no current track yet (or we already finished), advance.
+    let track = match queue.current() {
+        Some(t) if t.status == crate::network::messages::QueueItemStatus::Ready => {
+            t.clone()
+        }
+        Some(t) if t.status == crate::network::messages::QueueItemStatus::Playing => {
+            // Already playing — treat as resume.
+            let file_name = t.file_name.clone();
+            let duration_ms = (t.duration_secs * 1000.0) as u64;
+            drop(queue);
+
+            let mut audio = state.audio_output.lock().await;
+            if let Some(ref ao) = *audio {
+                ao.resume_at(std::time::Instant::now());
+            }
+            drop(audio);
+
             let _ = app.emit(
                 "playback:state-changed",
                 PlaybackStatePayload {
                     state: "playing".into(),
-                    file_name: String::new(),
+                    file_name,
                     position_ms: 0,
-                    duration_ms: 0,
+                    duration_ms,
                 },
             );
-            log::info!("Play command received");
-            Ok(())
+            return Ok(());
         }
-        _ => Err("Only the host can control playback.".into()),
+        _ => {
+            // Advance to the next ready track.
+            match queue.advance() {
+                Some(t) => t.clone(),
+                None => return Err("No tracks ready to play.".into()),
+            }
+        }
+    };
+
+    let track_id = track.id;
+    let file_name = track.file_name.clone();
+    let duration_secs = track.duration_secs;
+    let duration_ms = (duration_secs * 1000.0) as u64;
+
+    // Mark as Playing.
+    queue.mark_playing(track_id);
+    let queue_items = queue.get_queue();
+    drop(queue);
+    emit_queue_update(app, &queue_items);
+
+    // Get the raw file bytes.
+    let track_store = state.track_data.lock().await;
+    let file_bytes = track_store.get(&track_id)
+        .ok_or("Track data not found — file may have been removed.")?
+        .clone();
+    drop(track_store);
+
+    // Decode on a blocking thread to avoid blocking the async runtime.
+    let decoded = tokio::task::spawn_blocking(move || {
+        crate::audio::decoder::decode_mp3(&file_bytes)
+    })
+    .await
+    .map_err(|e| format!("Decode task failed: {e}"))?
+    .map_err(|e| format!("Failed to decode MP3: {e}"))?;
+
+    // Lazily create AudioOutput if it doesn't exist yet.
+    let mut audio = state.audio_output.lock().await;
+    if audio.is_none() {
+        let ao = AudioOutput::new().map_err(|e| format!("Failed to init audio: {e}"))?;
+        *audio = Some(ao);
     }
+
+    let ao = audio.as_ref().unwrap();
+
+    // Set volume.
+    let vol = *state.volume.lock();
+    ao.set_volume(vol);
+
+    // Load and play.
+    ao.load_track(decoded);
+    ao.play_at(std::time::Instant::now());
+
+    // Register track-finished callback.
+    let app_finished = app.clone();
+    ao.on_track_finished(move || {
+        let _ = app_finished.emit("playback:track-finished", ());
+    });
+    drop(audio);
+
+    // Emit state.
+    let _ = app.emit(
+        "playback:state-changed",
+        PlaybackStatePayload {
+            state: "playing".into(),
+            file_name: file_name.clone(),
+            position_ms: 0,
+            duration_ms,
+        },
+    );
+
+    // Start the position ticker.
+    start_position_ticker(app, state, duration_ms).await;
+
+    log::info!("Playing track '{}' ({} ms)", file_name, duration_ms);
+    Ok(())
 }
 
 #[tauri::command]
@@ -482,17 +589,37 @@ pub async fn pause(app: AppHandle) -> Result<(), String> {
 
     match &*session {
         Session::Host(_host) => {
+            drop(session);
             stop_position_ticker(&state).await;
+
+            let audio = state.audio_output.lock().await;
+            let (position_ms, file_name, duration_ms) = if let Some(ref ao) = *audio {
+                ao.pause();
+                let pos_frames = ao.get_position();
+                let sr = ao.playback_state().sample_rate.load(std::sync::atomic::Ordering::Acquire);
+                let pos_ms = if sr > 0 { (pos_frames as u64 * 1000) / sr as u64 } else { 0 };
+                drop(audio);
+
+                let queue = state.queue.lock().await;
+                let (fname, dur) = queue.current()
+                    .map(|t| (t.file_name.clone(), (t.duration_secs * 1000.0) as u64))
+                    .unwrap_or_default();
+                (pos_ms, fname, dur)
+            } else {
+                drop(audio);
+                (0, String::new(), 0)
+            };
+
             let _ = app.emit(
                 "playback:state-changed",
                 PlaybackStatePayload {
                     state: "paused".into(),
-                    file_name: String::new(),
-                    position_ms: 0,
-                    duration_ms: 0,
+                    file_name,
+                    position_ms,
+                    duration_ms,
                 },
             );
-            log::info!("Pause command received");
+            log::info!("Paused playback");
             Ok(())
         }
         _ => Err("Only the host can control playback.".into()),
@@ -506,7 +633,15 @@ pub async fn stop(app: AppHandle) -> Result<(), String> {
 
     match &*session {
         Session::Host(_host) => {
+            drop(session);
             stop_position_ticker(&state).await;
+
+            let audio = state.audio_output.lock().await;
+            if let Some(ref ao) = *audio {
+                ao.stop();
+            }
+            drop(audio);
+
             let _ = app.emit(
                 "playback:state-changed",
                 PlaybackStatePayload {
@@ -516,7 +651,7 @@ pub async fn stop(app: AppHandle) -> Result<(), String> {
                     duration_ms: 0,
                 },
             );
-            log::info!("Stop command received");
+            log::info!("Stopped playback");
             Ok(())
         }
         _ => Err("Only the host can control playback.".into()),
@@ -530,14 +665,30 @@ pub async fn seek(app: AppHandle, position_ms: u64) -> Result<(), String> {
 
     match &*session {
         Session::Host(_host) => {
-            log::info!("Seek to {position_ms} ms");
+            drop(session);
+
+            let audio = state.audio_output.lock().await;
+            if let Some(ref ao) = *audio {
+                let sr = ao.playback_state().sample_rate.load(std::sync::atomic::Ordering::Acquire);
+                let frame = (position_ms as u64 * sr as u64) / 1000;
+                ao.seek(frame);
+            }
+            drop(audio);
+
+            let queue = state.queue.lock().await;
+            let duration_ms = queue.current()
+                .map(|t| (t.duration_secs * 1000.0) as u64)
+                .unwrap_or(0);
+            drop(queue);
+
             let _ = app.emit(
                 "playback:position",
                 PlaybackPositionPayload {
                     position_ms,
-                    duration_ms: 0,
+                    duration_ms,
                 },
             );
+            log::info!("Seek to {position_ms} ms");
             Ok(())
         }
         _ => Err("Only the host can control playback.".into()),
@@ -551,6 +702,17 @@ pub async fn skip(app: AppHandle) -> Result<(), String> {
 
     match &*session {
         Session::Host(_host) => {
+            drop(session);
+
+            // Stop current playback.
+            stop_position_ticker(&state).await;
+            let audio = state.audio_output.lock().await;
+            if let Some(ref ao) = *audio {
+                ao.stop();
+            }
+            drop(audio);
+
+            // Advance the queue.
             let mut queue = state.queue.lock().await;
             let has_next = queue.skip().is_some();
             let queue_items = queue.get_queue();
@@ -559,9 +721,19 @@ pub async fn skip(app: AppHandle) -> Result<(), String> {
             emit_queue_update(&app, &queue_items);
 
             if has_next {
-                log::info!("Skipped to next track");
+                log::info!("Skipped to next track — starting playback");
+                play_current_track(&app, &state).await?;
             } else {
                 log::info!("Skip: no more tracks");
+                let _ = app.emit(
+                    "playback:state-changed",
+                    PlaybackStatePayload {
+                        state: "stopped".into(),
+                        file_name: String::new(),
+                        position_ms: 0,
+                        duration_ms: 0,
+                    },
+                );
             }
             Ok(())
         }
@@ -613,6 +785,9 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
             queue.mark_ready(track_id);
             let queue_items = queue.get_queue();
             drop(queue);
+
+            // Store the raw file bytes so we can decode & play later.
+            state.track_data.lock().await.insert(track_id, file_data);
             drop(session);
 
             emit_queue_update(&app, &queue_items);
@@ -774,13 +949,21 @@ pub async fn set_volume(app: AppHandle, volume: f32) -> Result<(), String> {
     let state = app.state::<AppState>();
     let clamped = volume.clamp(0.0, 1.0);
     *state.volume.lock() = clamped;
+
+    // Also apply to the live AudioOutput if it exists.
+    let audio = state.audio_output.lock().await;
+    if let Some(ref ao) = *audio {
+        ao.set_volume(clamped);
+    }
+
     log::info!("Volume set to {clamped:.2}");
     Ok(())
 }
 
 // ── Playback Position Ticker ────────────────────────────────────────────────
 
-/// Start a background task that emits `playback:position` every 500 ms.
+/// Start a background task that emits `playback:position` every 250 ms,
+/// reading the real position from AudioOutput.
 pub async fn start_position_ticker(
     app: &AppHandle,
     state: &AppState,
@@ -790,13 +973,42 @@ pub async fn start_position_ticker(
     stop_position_ticker(state).await;
 
     let app_clone = app.clone();
+    // We need a reference to the audio output's PlaybackState (which is Send+Sync).
+    let playback_state = {
+        let audio = state.audio_output.lock().await;
+        audio.as_ref().map(|ao| ao.playback_state())
+    };
+
     let handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
-        let mut position_ms: u64 = 0;
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(250));
 
         loop {
             interval.tick().await;
-            position_ms += 500;
+
+            let position_ms = if let Some(ref ps) = playback_state {
+                let pos_samples = ps.position.load(std::sync::atomic::Ordering::Acquire) as u64;
+                let channels = ps.channels.load(std::sync::atomic::Ordering::Acquire) as u64;
+                let sr = ps.sample_rate.load(std::sync::atomic::Ordering::Acquire) as u64;
+                if sr > 0 && channels > 0 {
+                    let frames = pos_samples / channels;
+                    (frames * 1000) / sr
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            // Check if the track ended (AudioOutput transitions to Stopped).
+            let is_stopped = playback_state.as_ref().map_or(true, |ps| {
+                ps.state.load(std::sync::atomic::Ordering::Acquire) == 0 // STATE_STOPPED
+            });
+
+            if is_stopped && position_ms > 0 {
+                // Track finished.
+                let _ = app_clone.emit("playback:track-finished", ());
+                break;
+            }
 
             if position_ms > duration_ms {
                 let _ = app_clone.emit("playback:track-finished", ());
