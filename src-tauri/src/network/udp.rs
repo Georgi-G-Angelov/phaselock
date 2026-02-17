@@ -25,7 +25,7 @@ const MAX_DGRAM_SIZE: usize = 256;
 static BASE_INSTANT: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// Get the base instant (lazily initialized on first call).
-fn base_instant() -> Instant {
+pub fn base_instant() -> Instant {
     *BASE_INSTANT.get_or_init(Instant::now)
 }
 

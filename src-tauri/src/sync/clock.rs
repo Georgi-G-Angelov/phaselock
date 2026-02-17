@@ -191,6 +191,14 @@ impl HostClockTracker {
         self.peer_latencies.get(&peer_id)
     }
 
+    /// Get a snapshot of all per-peer latencies (peer_id → one-way latency in ns).
+    pub fn get_all_latencies(&self) -> HashMap<u32, u64> {
+        self.peer_latencies
+            .iter()
+            .map(|(&id, pl)| (id, pl.estimated_one_way_ns))
+            .collect()
+    }
+
     /// Remove a peer (e.g. on disconnect).
     pub fn remove_peer(&mut self, peer_id: u32) {
         self.peer_latencies.remove(&peer_id);
