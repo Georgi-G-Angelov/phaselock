@@ -15,6 +15,7 @@
         type PlaybackState,
         type PlaybackPosition,
         type SyncLatency,
+        type SyncState,
         type ErrorEvent,
     } from '../types';
 
@@ -26,6 +27,10 @@
     // Connection / latency state
     let connected = true;
     let latencyMs: number | null = null;
+
+    // Sync state
+    let syncing = false;
+    let syncMessage = 'Syncing...';
 
     // Volume control
     let muted = false;
@@ -112,6 +117,10 @@
             await listen<ErrorEvent>(EVENTS.ERROR_GENERAL, (e) => {
                 toast?.show(e.payload.message, 'error');
             }),
+            await listen<SyncState>(EVENTS.SYNC_STATE, (e) => {
+                syncing = e.payload.syncing;
+                syncMessage = e.payload.message || 'Syncing...';
+            }),
         );
     });
 
@@ -121,6 +130,15 @@
 </script>
 
 <Toast bind:this={toast} />
+
+{#if syncing}
+<div class="sync-overlay">
+    <div class="sync-content">
+        <div class="sync-spinner"></div>
+        <p class="sync-text">{syncMessage}</p>
+    </div>
+</div>
+{/if}
 
 <div class="peer-session flex-col fade-in">
     <header class="session-header flex items-center justify-between p-4">
@@ -248,5 +266,43 @@
 
     .connection-status {
         white-space: nowrap;
+    }
+
+    .sync-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.75);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+    }
+
+    .sync-content {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1rem;
+    }
+
+    .sync-spinner {
+        width: 48px;
+        height: 48px;
+        border: 4px solid var(--bg-elevated);
+        border-top-color: var(--accent-green);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+        to { transform: rotate(360deg); }
+    }
+
+    .sync-text {
+        color: var(--text-primary);
+        font-size: 1.1rem;
     }
 </style>

@@ -1,5 +1,5 @@
 use crate::network::mdns::MdnsBroadcaster;
-use crate::network::messages::{Message, PeerInfo, SessionState};
+use crate::network::messages::{CurrentTrack, Message, PeerInfo, QueueItem, SessionState};
 use crate::network::tcp::{TcpEvent, TcpHost};
 use crate::network::udp::UdpHost;
 use crate::session::SessionEvent;
@@ -43,6 +43,10 @@ pub struct HostSession {
     event_tx: mpsc::Sender<SessionEvent>,
     tcp_port: u16,
     udp_port: u16,
+    /// Shared queue state — updated by the command layer.
+    pub queue_state: Arc<Mutex<Vec<QueueItem>>>,
+    /// Shared current track info — updated by the command layer.
+    pub current_track_state: Arc<Mutex<Option<CurrentTrack>>>,
     /// Handle to the TCP event processing loop.
     _event_loop_handle: Option<tokio::task::JoinHandle<()>>,
     /// Handle to the heartbeat sending task.
@@ -107,6 +111,9 @@ impl HostSession {
         // at 1, so they will match (we rely on this in the event loop).
         let next_peer_id = Arc::new(AtomicU32::new(1));
 
+        let queue_state: Arc<Mutex<Vec<QueueItem>>> = Arc::new(Mutex::new(Vec::new()));
+        let current_track_state: Arc<Mutex<Option<CurrentTrack>>> = Arc::new(Mutex::new(None));
+
         let host = Self {
             session_name,
             host_display_name,
@@ -118,6 +125,8 @@ impl HostSession {
             event_tx: session_event_tx,
             tcp_port,
             udp_port,
+            queue_state: queue_state.clone(),
+            current_track_state: current_track_state.clone(),
             _event_loop_handle: None,
             _heartbeat_handle: None,
         };
@@ -135,6 +144,8 @@ impl HostSession {
             host.host_display_name.clone(),
             host.tcp_port,
             host.udp_port,
+            queue_state,
+            current_track_state,
         );
 
         // We need to set the handles after construction since we used `self` fields.
@@ -163,6 +174,8 @@ impl HostSession {
         host_display_name: String,
         tcp_port: u16,
         udp_port: u16,
+        queue_state: Arc<Mutex<Vec<QueueItem>>>,
+        current_track_state: Arc<Mutex<Option<CurrentTrack>>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(tcp_event) = tcp_event_rx.recv().await {
@@ -182,6 +195,8 @@ impl HostSession {
                             &host_display_name,
                             tcp_port,
                             udp_port,
+                            &queue_state,
+                            &current_track_state,
                         )
                         .await;
                     }
@@ -197,7 +212,8 @@ impl HostSession {
 
                             // Broadcast updated peer list.
                             let peer_list = Self::build_peer_list(&peers);
-                            let queue = Vec::new(); // queue managed elsewhere
+                            let queue = queue_state.lock().clone();
+                            let current_track = current_track_state.lock().clone();
                             let state = Message::JoinAccepted {
                                 peer_id: 0, // not used for broadcast
                                 session_state: SessionState {
@@ -205,7 +221,7 @@ impl HostSession {
                                     host_name: host_display_name.clone(),
                                     peers: peer_list,
                                     queue,
-                                    current_track: None,
+                                    current_track,
                                 },
                             };
                             tcp_host.broadcast(&state).await;
@@ -233,6 +249,8 @@ impl HostSession {
         host_display_name: &str,
         _tcp_port: u16,
         _udp_port: u16,
+        queue_state: &Arc<Mutex<Vec<QueueItem>>>,
+        current_track_state: &Arc<Mutex<Option<CurrentTrack>>>,
     ) {
         match message {
             Message::JoinRequest { display_name } => {
@@ -276,12 +294,14 @@ impl HostSession {
 
                 // Build current session state.
                 let peer_list = Self::build_peer_list(peers);
+                let queue = queue_state.lock().clone();
+                let current_track = current_track_state.lock().clone();
                 let session_state = SessionState {
                     session_name: session_name.to_string(),
                     host_name: host_display_name.to_string(),
                     peers: peer_list.clone(),
-                    queue: Vec::new(), // queue managed elsewhere
-                    current_track: None,
+                    queue: queue.clone(),
+                    current_track: current_track.clone(),
                 };
 
                 // Send JoinAccepted to the new peer.
@@ -304,7 +324,13 @@ impl HostSession {
                                 pid,
                                 &Message::JoinAccepted {
                                     peer_id: pid,
-                                    session_state: session_state.clone(),
+                                    session_state: SessionState {
+                                        session_name: session_name.to_string(),
+                                        host_name: host_display_name.to_string(),
+                                        peers: peer_list.clone(),
+                                        queue: queue.clone(),
+                                        current_track: current_track.clone(),
+                                    },
                                 },
                             )
                             .await;
@@ -334,14 +360,16 @@ impl HostSession {
 
                     // Broadcast updated peer list.
                     let peer_list = Self::build_peer_list(peers);
+                    let queue = queue_state.lock().clone();
+                    let current_track = current_track_state.lock().clone();
                     let state_msg = Message::JoinAccepted {
                         peer_id: 0,
                         session_state: SessionState {
                             session_name: session_name.to_string(),
                             host_name: host_display_name.to_string(),
                             peers: peer_list,
-                            queue: Vec::new(),
-                            current_track: None,
+                            queue,
+                            current_track,
                         },
                     };
                     tcp_host.broadcast(&state_msg).await;
@@ -372,6 +400,17 @@ impl HostSession {
                     .send(SessionEvent::MessageReceived {
                         peer_id,
                         message: Message::FileReceived { file_id, hash_ok },
+                    })
+                    .await;
+            }
+
+            Message::FileCacheReport { file_ids } => {
+                log::info!("Peer {peer_id} reports cached files: {:?}", file_ids);
+                // Forward to the app layer so it can decide which files to transfer.
+                let _ = event_tx
+                    .send(SessionEvent::MessageReceived {
+                        peer_id,
+                        message: Message::FileCacheReport { file_ids },
                     })
                     .await;
             }

@@ -1,4 +1,4 @@
-use crate::network::messages::{Message, PeerInfo, SessionState};
+use crate::network::messages::{CurrentTrack, Message, PeerInfo, QueueItem, SessionState};
 use crate::network::tcp::{TcpEvent, TcpPeer};
 use crate::network::udp::UdpPeer;
 use crate::session::SessionEvent;
@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
+use uuid::Uuid;
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -25,6 +26,8 @@ pub struct PeerSession {
     pub tcp_peer: TcpPeer,
     pub clock_sync: Arc<Mutex<ClockSync>>,
     pub peers: Arc<Mutex<Vec<PeerInfo>>>,
+    pub queue: Arc<Mutex<Vec<QueueItem>>>,
+    pub current_track: Arc<Mutex<Option<CurrentTrack>>>,
     pub event_tx: mpsc::Sender<SessionEvent>,
     pub udp_peer: Option<UdpPeer>,
     /// Handle to the background message dispatch loop.
@@ -75,6 +78,8 @@ impl PeerSession {
         let session_name = session_state.session_name.clone();
         let host_name = session_state.host_name.clone();
         let peers = Arc::new(Mutex::new(session_state.peers.clone()));
+        let queue = Arc::new(Mutex::new(session_state.queue.clone()));
+        let current_track = Arc::new(Mutex::new(session_state.current_track.clone()));
 
         // ── UDP clock sync ──
         let (udp_peer, clock_sync) = if skip_udp {
@@ -96,6 +101,8 @@ impl PeerSession {
         let dispatch_handle = Self::spawn_dispatch_loop(
             tcp_event_rx,
             peers.clone(),
+            queue.clone(),
+            current_track.clone(),
             session_event_tx.clone(),
         );
 
@@ -108,6 +115,8 @@ impl PeerSession {
                 tcp_peer,
                 clock_sync,
                 peers,
+                queue,
+                current_track,
                 event_tx: session_event_tx,
                 udp_peer,
                 _dispatch_handle: Some(dispatch_handle),
@@ -165,6 +174,8 @@ impl PeerSession {
     fn spawn_dispatch_loop(
         mut tcp_event_rx: mpsc::Receiver<TcpEvent>,
         peers: Arc<Mutex<Vec<PeerInfo>>>,
+        queue: Arc<Mutex<Vec<QueueItem>>>,
+        current_track: Arc<Mutex<Option<CurrentTrack>>>,
         event_tx: mpsc::Sender<SessionEvent>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -179,10 +190,20 @@ impl PeerSession {
                             }
 
                             Message::JoinAccepted { session_state, .. } => {
-                                // Updated peer list from host.
+                                // Updated peer list and session state from host.
                                 *peers.lock() = session_state.peers.clone();
-                                // Don't emit a SessionEvent for state updates —
-                                // the caller can poll peers directly.
+                                *queue.lock() = session_state.queue.clone();
+                                *current_track.lock() = session_state.current_track.clone();
+                            }
+
+                            Message::QueueUpdate { queue: q } => {
+                                *queue.lock() = q.clone();
+                                let _ = event_tx
+                                    .send(SessionEvent::MessageReceived {
+                                        peer_id: 0,
+                                        message,
+                                    })
+                                    .await;
                             }
 
                             Message::Heartbeat => {
@@ -219,9 +240,28 @@ impl PeerSession {
         self.tcp_peer.send(msg).await
     }
 
+    /// Send a FileCacheReport to the host, telling it which files we already have.
+    pub async fn send_file_cache_report(&mut self, cached_ids: Vec<Uuid>) {
+        log::info!("Sending FileCacheReport with {} cached files", cached_ids.len());
+        let _ = self
+            .tcp_peer
+            .send(&Message::FileCacheReport { file_ids: cached_ids })
+            .await;
+    }
+
     /// Get the current peer list.
     pub fn peer_list(&self) -> Vec<PeerInfo> {
         self.peers.lock().clone()
+    }
+
+    /// Get the current queue.
+    pub fn get_queue(&self) -> Vec<QueueItem> {
+        self.queue.lock().clone()
+    }
+
+    /// Get the current track info.
+    pub fn get_current_track(&self) -> Option<CurrentTrack> {
+        self.current_track.lock().clone()
     }
 
     /// Leave the session gracefully: send LeaveSession and shut down.
@@ -570,6 +610,338 @@ mod tests {
             }
 
             assert!(got_disconnect, "Peer should receive HostDisconnected");
+        })
+        .await
+        .unwrap();
+    }
+
+    // ── Test 6: Reconnect receives session state ────────────────────────
+
+    #[tokio::test]
+    async fn test_reconnect_receives_session_state() {
+        use crate::network::messages::{CurrentTrack, QueueItem, QueueItemStatus};
+
+        let _ = timeout(Duration::from_secs(20), async {
+            let (tcp_port, udp_port) = free_ports().await;
+
+            let (host, mut host_events) = HostSession::start(
+                "Reconnect Test".into(),
+                "Host".into(),
+                tcp_port,
+                udp_port,
+                true,
+            )
+            .await
+            .unwrap();
+
+            sleep(Duration::from_millis(50)).await;
+
+            // Set up queue state on the host.
+            let track_id = Uuid::new_v4();
+            {
+                let mut q = host.queue_state.lock();
+                q.push(QueueItem {
+                    id: track_id,
+                    file_name: "song.mp3".into(),
+                    duration_secs: 180.0,
+                    added_by: "Host".into(),
+                    status: QueueItemStatus::Playing,
+                });
+            }
+            {
+                let mut ct = host.current_track_state.lock();
+                *ct = Some(CurrentTrack {
+                    file_id: track_id,
+                    file_name: "song.mp3".into(),
+                    position_samples: 44100 * 30, // 30 seconds in
+                    sample_rate: 44100,
+                    is_playing: true,
+                });
+            }
+
+            // First peer joins.
+            let (mut peer1, _pe1) = PeerSession::join(
+                tcp_addr(tcp_port),
+                tcp_addr(udp_port),
+                "Alice".into(),
+                true,
+            )
+            .await
+            .unwrap();
+
+            // Wait for host to process join.
+            let _ = host_events.recv().await;
+            sleep(Duration::from_millis(100)).await;
+
+            // Verify peer received the queue and current track.
+            let q = peer1.get_queue();
+            assert_eq!(q.len(), 1);
+            assert_eq!(q[0].file_name, "song.mp3");
+
+            let ct = peer1.get_current_track();
+            assert!(ct.is_some());
+            let ct = ct.unwrap();
+            assert_eq!(ct.file_id, track_id);
+            assert!(ct.is_playing);
+            assert_eq!(ct.position_samples, 44100 * 30);
+
+            // Peer leaves (simulating disconnect).
+            peer1.leave().await;
+            sleep(Duration::from_millis(200)).await;
+
+            // Drain host events.
+            while host_events.try_recv().is_ok() {}
+
+            // Peer reconnects.
+            let (peer2, _pe2) = PeerSession::join(
+                tcp_addr(tcp_port),
+                tcp_addr(udp_port),
+                "Alice".into(),
+                true,
+            )
+            .await
+            .unwrap();
+
+            // Wait for host to process.
+            let _ = host_events.recv().await;
+            sleep(Duration::from_millis(100)).await;
+
+            // Verify reconnected peer got the session state.
+            let q2 = peer2.get_queue();
+            assert_eq!(q2.len(), 1);
+            assert_eq!(q2[0].file_name, "song.mp3");
+
+            let ct2 = peer2.get_current_track();
+            assert!(ct2.is_some());
+            let ct2 = ct2.unwrap();
+            assert_eq!(ct2.file_id, track_id);
+            assert!(ct2.is_playing);
+
+            host.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    // ── Test 7: Reconnect when music is paused ──────────────────────────
+
+    #[tokio::test]
+    async fn test_reconnect_paused_state() {
+        use crate::network::messages::{CurrentTrack, QueueItem, QueueItemStatus};
+
+        let _ = timeout(Duration::from_secs(20), async {
+            let (tcp_port, udp_port) = free_ports().await;
+
+            let (host, mut host_events) = HostSession::start(
+                "Paused Test".into(),
+                "Host".into(),
+                tcp_port,
+                udp_port,
+                true,
+            )
+            .await
+            .unwrap();
+
+            sleep(Duration::from_millis(50)).await;
+
+            // Set up paused track.
+            let track_id = Uuid::new_v4();
+            {
+                let mut q = host.queue_state.lock();
+                q.push(QueueItem {
+                    id: track_id,
+                    file_name: "ballad.mp3".into(),
+                    duration_secs: 240.0,
+                    added_by: "Host".into(),
+                    status: QueueItemStatus::Playing,
+                });
+            }
+            {
+                let mut ct = host.current_track_state.lock();
+                *ct = Some(CurrentTrack {
+                    file_id: track_id,
+                    file_name: "ballad.mp3".into(),
+                    position_samples: 44100 * 60, // 1 minute in
+                    sample_rate: 44100,
+                    is_playing: false, // paused
+                });
+            }
+
+            // Peer joins.
+            let (peer, _pe) = PeerSession::join(
+                tcp_addr(tcp_port),
+                tcp_addr(udp_port),
+                "Bob".into(),
+                true,
+            )
+            .await
+            .unwrap();
+
+            let _ = host_events.recv().await;
+            sleep(Duration::from_millis(100)).await;
+
+            // Verify peer sees paused state.
+            let ct = peer.get_current_track().unwrap();
+            assert!(!ct.is_playing, "Track should be paused");
+            assert_eq!(ct.position_samples, 44100 * 60);
+
+            host.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    // ── Test 8: Reconnect with multiple queue tracks ────────────────────
+
+    #[tokio::test]
+    async fn test_reconnect_multiple_queue_tracks() {
+        use crate::network::messages::{CurrentTrack, QueueItem, QueueItemStatus};
+
+        let _ = timeout(Duration::from_secs(20), async {
+            let (tcp_port, udp_port) = free_ports().await;
+
+            let (host, mut host_events) = HostSession::start(
+                "Multi Track Test".into(),
+                "Host".into(),
+                tcp_port,
+                udp_port,
+                true,
+            )
+            .await
+            .unwrap();
+
+            sleep(Duration::from_millis(50)).await;
+
+            // Set up 3 tracks in the queue.
+            let id1 = Uuid::new_v4();
+            let id2 = Uuid::new_v4();
+            let id3 = Uuid::new_v4();
+            {
+                let mut q = host.queue_state.lock();
+                q.push(QueueItem {
+                    id: id1,
+                    file_name: "track1.mp3".into(),
+                    duration_secs: 200.0,
+                    added_by: "Host".into(),
+                    status: QueueItemStatus::Played,
+                });
+                q.push(QueueItem {
+                    id: id2,
+                    file_name: "track2.mp3".into(),
+                    duration_secs: 180.0,
+                    added_by: "Host".into(),
+                    status: QueueItemStatus::Playing,
+                });
+                q.push(QueueItem {
+                    id: id3,
+                    file_name: "track3.mp3".into(),
+                    duration_secs: 210.0,
+                    added_by: "Alice".into(),
+                    status: QueueItemStatus::Ready,
+                });
+            }
+            {
+                let mut ct = host.current_track_state.lock();
+                *ct = Some(CurrentTrack {
+                    file_id: id2,
+                    file_name: "track2.mp3".into(),
+                    position_samples: 44100 * 10,
+                    sample_rate: 44100,
+                    is_playing: true,
+                });
+            }
+
+            // Peer joins.
+            let (peer, _pe) = PeerSession::join(
+                tcp_addr(tcp_port),
+                tcp_addr(udp_port),
+                "Carol".into(),
+                true,
+            )
+            .await
+            .unwrap();
+
+            let _ = host_events.recv().await;
+            sleep(Duration::from_millis(100)).await;
+
+            // Verify all 3 tracks received.
+            let q = peer.get_queue();
+            assert_eq!(q.len(), 3);
+            assert_eq!(q[0].file_name, "track1.mp3");
+            assert_eq!(q[0].status, QueueItemStatus::Played);
+            assert_eq!(q[1].file_name, "track2.mp3");
+            assert_eq!(q[1].status, QueueItemStatus::Playing);
+            assert_eq!(q[2].file_name, "track3.mp3");
+            assert_eq!(q[2].status, QueueItemStatus::Ready);
+
+            // Verify current track is track2.
+            let ct = peer.get_current_track().unwrap();
+            assert_eq!(ct.file_id, id2);
+
+            host.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    // ── Test 9: FileCacheReport is received by host ─────────────────────
+
+    #[tokio::test]
+    async fn test_file_cache_report_received_by_host() {
+        let _ = timeout(Duration::from_secs(20), async {
+            let (tcp_port, udp_port) = free_ports().await;
+
+            let (host, mut host_events) = HostSession::start(
+                "Cache Test".into(),
+                "Host".into(),
+                tcp_port,
+                udp_port,
+                true,
+            )
+            .await
+            .unwrap();
+
+            sleep(Duration::from_millis(50)).await;
+
+            let (mut peer, _pe) = PeerSession::join(
+                tcp_addr(tcp_port),
+                tcp_addr(udp_port),
+                "Dave".into(),
+                true,
+            )
+            .await
+            .unwrap();
+
+            // Wait for PeerJoined.
+            let _ = host_events.recv().await;
+            sleep(Duration::from_millis(100)).await;
+
+            // Peer sends FileCacheReport.
+            let cached_id = Uuid::new_v4();
+            peer.send_file_cache_report(vec![cached_id]).await;
+
+            // Host should receive it as a MessageReceived event.
+            let mut received = false;
+            for _ in 0..20 {
+                match timeout(Duration::from_millis(200), host_events.recv()).await {
+                    Ok(Some(SessionEvent::MessageReceived { message, .. })) => {
+                        if let Message::FileCacheReport { file_ids } = message {
+                            assert_eq!(file_ids.len(), 1);
+                            assert_eq!(file_ids[0], cached_id);
+                            received = true;
+                            break;
+                        }
+                    }
+                    Ok(Some(_)) => continue,
+                    _ => {
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                }
+            }
+
+            assert!(received, "Host should receive FileCacheReport");
+
+            host.shutdown().await;
         })
         .await
         .unwrap();

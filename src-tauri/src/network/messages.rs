@@ -35,6 +35,10 @@ pub enum Message {
 
     // Queue sync
     QueueUpdate { queue: Vec<QueueItem> },
+
+    // Reconnection
+    /// Sent by a peer after joining to tell the host which files it already has cached.
+    FileCacheReport { file_ids: Vec<Uuid> },
 }
 
 // ── Supporting Structs ──────────────────────────────────────────────────────

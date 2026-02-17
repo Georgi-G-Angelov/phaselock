@@ -1,7 +1,8 @@
 use crate::network::mdns::{DiscoveredSession, MdnsBrowser};
-use crate::network::messages::QueueItem;
+use crate::network::messages::{CurrentTrack, QueueItem};
 use crate::queue::manager::QueueManager;
 use crate::session::Session;
+use crate::transfer::file_cache::FileCache;
 use crate::transfer::song_request::SongRequestManager;
 use parking_lot::Mutex as ParkingMutex;
 use serde::Serialize;
@@ -101,6 +102,12 @@ struct ErrorPayload {
 }
 
 #[derive(Clone, Serialize)]
+struct SyncStatePayload {
+    syncing: bool,
+    message: String,
+}
+
+#[derive(Clone, Serialize)]
 pub struct SessionInfoPayload {
     pub session_name: String,
     pub host_name: String,
@@ -119,6 +126,12 @@ pub struct AppState {
     pub mdns_browser: Mutex<Option<MdnsBrowser>>,
     /// Handle to the position ticker task (so we can abort it).
     pub position_ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Peer-side file cache — persists across reconnects within the same app session.
+    pub file_cache: Mutex<FileCache>,
+    /// Host-side shared queue state (kept in sync with QueueManager for session broadcasts).
+    pub host_queue_state: std::sync::Arc<ParkingMutex<Vec<QueueItem>>>,
+    /// Host-side shared current track state (for session broadcasts).
+    pub host_current_track: std::sync::Arc<ParkingMutex<Option<CurrentTrack>>>,
 }
 
 impl AppState {
@@ -130,6 +143,9 @@ impl AppState {
             volume: ParkingMutex::new(1.0),
             mdns_browser: Mutex::new(None),
             position_ticker: Mutex::new(None),
+            file_cache: Mutex::new(FileCache::new()),
+            host_queue_state: std::sync::Arc::new(ParkingMutex::new(Vec::new())),
+            host_current_track: std::sync::Arc::new(ParkingMutex::new(None)),
         }
     }
 }
@@ -147,6 +163,10 @@ fn emit_error(app: &AppHandle, msg: &str) {
 }
 
 fn emit_queue_update(app: &AppHandle, queue: &[QueueItem]) {
+    // Also update the shared host queue state so HostSession broadcasts it.
+    let state = app.state::<AppState>();
+    *state.host_queue_state.lock() = queue.to_vec();
+
     let _ = app.emit(
         "queue:updated",
         QueueUpdatedPayload {
@@ -201,7 +221,11 @@ pub async fn create_session(
     let udp_port = 17402u16;
 
     match HostSession::start(session_name.clone(), display_name.clone(), tcp_port, udp_port, false).await {
-        Ok((host_session, mut event_rx)) => {
+        Ok((mut host_session, mut event_rx)) => {
+            // Wire the shared queue/track state into the host session.
+            host_session.queue_state = state.host_queue_state.clone();
+            host_session.current_track_state = state.host_current_track.clone();
+
             let info = SessionInfoPayload {
                 session_name: host_session.session_name.clone(),
                 host_name: host_session.host_display_name.clone(),
@@ -285,13 +309,53 @@ pub async fn join_session(
     let udp_addr = SocketAddr::new(tcp_addr.ip(), tcp_addr.port() + 1);
 
     match PeerSession::join(tcp_addr, udp_addr, display_name.clone(), false).await {
-        Ok((peer_session, mut event_rx)) => {
+        Ok((mut peer_session, mut event_rx)) => {
             let info = SessionInfoPayload {
                 session_name: peer_session.session_name.clone(),
                 host_name: peer_session.host_name.clone(),
                 is_host: false,
                 peer_id: Some(peer_session.peer_id),
             };
+
+            // Emit initial queue from session state.
+            let initial_queue = peer_session.get_queue();
+            if !initial_queue.is_empty() {
+                emit_queue_update(&app, &initial_queue);
+            }
+
+            // Emit initial current track / playback state.
+            if let Some(track) = peer_session.get_current_track() {
+                let position_ms = if track.sample_rate > 0 {
+                    (track.position_samples as f64 / track.sample_rate as f64 * 1000.0) as u64
+                } else {
+                    0
+                };
+                let _ = app.emit(
+                    "playback:state-changed",
+                    PlaybackStatePayload {
+                        state: if track.is_playing { "playing".into() } else { "paused".into() },
+                        file_name: track.file_name.clone(),
+                        position_ms,
+                        duration_ms: 0,
+                    },
+                );
+            }
+
+            // Send FileCacheReport to host.
+            {
+                let cache = state.file_cache.lock().await;
+                let cached_ids = cache.cached_ids();
+                peer_session.send_file_cache_report(cached_ids).await;
+            }
+
+            // Emit syncing state — peer may need files.
+            let needs_sync = !initial_queue.is_empty();
+            if needs_sync {
+                let _ = app.emit("sync:state", SyncStatePayload {
+                    syncing: true,
+                    message: "Syncing with session...".into(),
+                });
+            }
 
             *session = Session::Peer(peer_session);
             drop(session);

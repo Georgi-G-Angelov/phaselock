@@ -74,6 +74,11 @@ export interface ErrorEvent {
   message: string;
 }
 
+export interface SyncState {
+  syncing: boolean;
+  message: string;
+}
+
 // ── Tauri event name constants ──────────────────────────────────────────────
 
 export const EVENTS = {
@@ -105,6 +110,7 @@ export const EVENTS = {
 
   // Sync
   SYNC_LATENCY_UPDATED: 'sync:latency-updated',
+  SYNC_STATE: 'sync:state',
 
   // Error
   ERROR_GENERAL: 'error:general',
