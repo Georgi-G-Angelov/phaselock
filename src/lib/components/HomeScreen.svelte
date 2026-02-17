@@ -19,6 +19,8 @@
                 Join a Jam
             </button>
         </div>
+
+        <span class="version-label text-xs text-secondary">v0.1.0</span>
     </div>
 </div>
 
@@ -35,5 +37,10 @@
 
     .logo-title {
         font-size: 2.5rem;
+    }
+
+    .version-label {
+        margin-top: 1rem;
+        opacity: 0.5;
     }
 </style>

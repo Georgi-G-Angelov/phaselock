@@ -19,7 +19,7 @@
                 style:width="{$playbackStore.duration_ms > 0
                     ? ($playbackStore.position_ms / $playbackStore.duration_ms) * 100
                     : 0}%"
-            />
+            ></div>
         </div>
 
         <div class="transport-controls flex-center gap-3">
