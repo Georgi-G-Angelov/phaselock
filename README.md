@@ -1,6 +1,19 @@
 # PhaseLock
 
+[![CI](https://github.com/user/phaselock/actions/workflows/ci.yml/badge.svg)](https://github.com/user/phaselock/actions/workflows/ci.yml)
+[![Build & Release](https://github.com/user/phaselock/actions/workflows/release.yml/badge.svg)](https://github.com/user/phaselock/actions/workflows/release.yml)
+
 Synchronized music playback for groups. Like Spotify Jam, but with perfect sync.
+
+## Download Pre-built Releases
+
+Head to the [Releases](https://github.com/user/phaselock/releases) page and grab the installer for your platform:
+
+| Platform | Download |
+|----------|----------|
+| Windows  | `.exe` (NSIS) or `.msi` (WiX) |
+| macOS    | `.dmg` (Apple Silicon & Intel) |
+| Linux    | `.AppImage` or `.deb` |
 
 ## Prerequisites
 
@@ -73,3 +86,24 @@ phaselock/
 ├── vite.config.ts
 └── svelte.config.js
 ```
+
+## Architecture
+
+PhaseLock uses a **host/peer** networking model:
+
+1. **Host** creates a session and advertises it via mDNS on the local network.
+2. **Peers** discover sessions and connect over TCP (control messages) and UDP (sync & audio).
+3. **NTP-style clock synchronisation** keeps all peers within ~1 ms of the host clock.
+4. Hosts manage a shared **queue** and stream audio files to peers via **chunked file transfer**.
+5. Playback uses **symphonia** for MP3 decoding and **cpal** for low-latency audio output.
+
+## Contributing
+
+1. Fork the repository.
+2. Create a feature branch (`git checkout -b feat/my-feature`).
+3. Run `cd src-tauri && cargo fmt && cargo clippy -- -D warnings && cargo test` before committing.
+4. Open a Pull Request — CI must be green.
+
+## License
+
+MIT

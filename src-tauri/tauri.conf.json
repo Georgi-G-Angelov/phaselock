@@ -32,6 +32,24 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": [],
+    "shortDescription": "Synchronized music playback for groups",
+    "longDescription": "PhaseLock allows multiple devices to connect in a jam session and play music in perfect sync.",
+    "copyright": "",
+    "category": "Music",
+    "windows": {
+      "wix": {
+        "language": "en-US"
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    }
   }
 }
