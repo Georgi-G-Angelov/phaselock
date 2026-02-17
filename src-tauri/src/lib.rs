@@ -7,6 +7,8 @@ mod session;
 mod sync;
 mod transfer;
 
+use commands::AppState;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize the logger before anything else.
@@ -21,7 +23,25 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![commands::greet])
+        .manage(AppState::new())
+        .invoke_handler(tauri::generate_handler![
+            commands::create_session,
+            commands::join_session,
+            commands::leave_session,
+            commands::get_discovered_sessions,
+            commands::play,
+            commands::pause,
+            commands::stop,
+            commands::seek,
+            commands::skip,
+            commands::add_song,
+            commands::remove_from_queue,
+            commands::reorder_queue,
+            commands::request_song,
+            commands::accept_song_request,
+            commands::reject_song_request,
+            commands::set_volume,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running PhaseLock");
 }
