@@ -1,30 +1,22 @@
 <script lang="ts">
+    import HomeScreen from './lib/components/HomeScreen.svelte';
+    import CreateJam from './lib/components/CreateJam.svelte';
+    import SessionBrowser from './lib/components/SessionBrowser.svelte';
+    import HostSession from './lib/components/HostSession.svelte';
+    import PeerSession from './lib/components/PeerSession.svelte';
+
+    type Screen = 'home' | 'create' | 'browse' | 'host-session' | 'peer-session';
+    let currentScreen: Screen = 'home';
 </script>
 
-<main>
-  <h1>🎵 PhaseLock</h1>
-  <p>Synchronized music playback</p>
-</main>
-
-<style>
-  main {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    height: 100vh;
-    background-color: #121212;
-    color: #ffffff;
-    font-family: system-ui, -apple-system, sans-serif;
-  }
-
-  h1 {
-    font-size: 3rem;
-    margin-bottom: 0.5rem;
-  }
-
-  p {
-    color: #b3b3b3;
-    font-size: 1.2rem;
-  }
-</style>
+{#if currentScreen === 'home'}
+    <HomeScreen on:create={() => currentScreen = 'create'} on:join={() => currentScreen = 'browse'} />
+{:else if currentScreen === 'create'}
+    <CreateJam on:created={() => currentScreen = 'host-session'} on:back={() => currentScreen = 'home'} />
+{:else if currentScreen === 'browse'}
+    <SessionBrowser on:joined={() => currentScreen = 'peer-session'} on:back={() => currentScreen = 'home'} />
+{:else if currentScreen === 'host-session'}
+    <HostSession on:ended={() => currentScreen = 'home'} />
+{:else if currentScreen === 'peer-session'}
+    <PeerSession on:disconnected={() => currentScreen = 'home'} />
+{/if}
