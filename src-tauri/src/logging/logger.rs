@@ -9,7 +9,8 @@ use std::path::PathBuf;
 // ── Constants ───────────────────────────────────────────────────────────────
 
 /// Number of buffered entries before an automatic flush.
-const FLUSH_THRESHOLD: usize = 50;
+/// Set to 1 so every log line is flushed to disk immediately (debug mode).
+const FLUSH_THRESHOLD: usize = 1;
 
 /// Maximum log file size in bytes (20 MB) before rotation.
 const MAX_FILE_SIZE: u64 = 20 * 1024 * 1024;
@@ -232,19 +233,15 @@ mod tests {
 
     #[test]
     fn test_buffer_does_not_flush_before_threshold() {
+        // With FLUSH_THRESHOLD = 1, every line flushes immediately.
+        // This test is kept for structural consistency; it just
+        // confirms that a single push triggers a flush (i.e. buffer is empty afterwards).
         let dir = TempDir::new().unwrap();
         let logger = setup_test_logger(&dir);
 
-        // Write 49 INFO entries — should stay buffered, file should not exist.
-        for i in 0..49 {
-            push_line(&logger, Level::Info, &format!("msg {i}"));
-        }
-
-        let contents = read_log(&logger);
-        assert!(contents.is_empty(), "log file should be empty before threshold");
-
-        // Confirm the buffer holds 49 entries.
-        assert_eq!(logger.inner.lock().buffer.len(), 49);
+        push_line(&logger, Level::Info, "msg 0");
+        // Should have flushed immediately.
+        assert_eq!(logger.inner.lock().buffer.len(), 0);
     }
 
     #[test]
@@ -273,12 +270,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let logger = setup_test_logger(&dir);
 
-        // Write a few INFO lines — should stay buffered.
+        // With FLUSH_THRESHOLD=1, every line is flushed immediately.
         push_line(&logger, Level::Info, "info 1");
         push_line(&logger, Level::Info, "info 2");
-        assert!(read_log(&logger).is_empty());
-
-        // Write one ERROR — should flush all 3 lines.
         push_line(&logger, Level::Error, "something broke");
 
         let contents = read_log(&logger);
@@ -369,10 +363,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let logger = setup_test_logger(&dir);
 
+        // With FLUSH_THRESHOLD=1, even the first line is flushed immediately.
         push_line(&logger, Level::Info, "buffered");
-        assert!(read_log(&logger).is_empty());
-
-        flush(&logger);
 
         let contents = read_log(&logger);
         assert!(contents.contains("buffered"));

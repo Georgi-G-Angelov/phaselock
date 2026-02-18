@@ -216,6 +216,7 @@ impl TcpHost {
             let map = self.connections.lock();
             map.keys().copied().collect()
         };
+        log::info!("[TcpHost::broadcast] Sending to {} peer(s): {:?}", peer_ids.len(), peer_ids);
         for pid in peer_ids {
             self.send_to_peer(pid, msg).await;
         }

@@ -37,6 +37,7 @@
                 queueStore.set(e.payload.queue);
             }),
             await listen<PlaybackState>(EVENTS.PLAYBACK_STATE_CHANGED, (e) => {
+                console.log('[HostSession] PLAYBACK_STATE_CHANGED:', e.payload);
                 playbackStore.set(e.payload);
             }),
             await listen<PlaybackPosition>(EVENTS.PLAYBACK_POSITION, (e) => {

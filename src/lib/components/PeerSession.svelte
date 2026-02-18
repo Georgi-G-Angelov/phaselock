@@ -77,12 +77,15 @@
     onMount(async () => {
         unlisteners.push(
             await listen<{ queue: QueueItem[] }>(EVENTS.QUEUE_UPDATED, (e) => {
+                console.log('[PeerSession] QUEUE_UPDATED:', e.payload.queue.length, 'items', e.payload.queue);
                 queueStore.set(e.payload.queue);
             }),
             await listen<PlaybackState>(EVENTS.PLAYBACK_STATE_CHANGED, (e) => {
+                console.log('[PeerSession] PLAYBACK_STATE_CHANGED:', e.payload);
                 playbackStore.set(e.payload);
             }),
             await listen<PlaybackPosition>(EVENTS.PLAYBACK_POSITION, (e) => {
+                console.log('[PeerSession] PLAYBACK_POSITION:', e.payload.position_ms, '/', e.payload.duration_ms);
                 playbackStore.update(s => ({ ...s, position_ms: e.payload.position_ms, duration_ms: e.payload.duration_ms }));
             }),
             await listen(EVENTS.SESSION_ENDED, () => {
@@ -115,6 +118,7 @@
                 toast?.show(e.payload.message, 'error');
             }),
             await listen<SyncState>(EVENTS.SYNC_STATE, (e) => {
+                console.log('[PeerSession] SYNC_STATE:', e.payload);
                 syncing = e.payload.syncing;
                 syncMessage = e.payload.message || 'Syncing...';
             }),

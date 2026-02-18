@@ -182,6 +182,7 @@ impl PeerSession {
             while let Some(event) = tcp_event_rx.recv().await {
                 match event {
                     TcpEvent::MessageReceived { message, .. } => {
+                        log::info!("[peer::dispatch] Received message: {:?}", std::mem::discriminant(&message));
                         match &message {
                             Message::SessionEnd => {
                                 log::info!("Host ended the session");
@@ -212,6 +213,7 @@ impl PeerSession {
 
                             _ => {
                                 // Forward everything else to the app.
+                                log::info!("[peer::dispatch] Forwarding message to app layer");
                                 let _ = event_tx
                                     .send(SessionEvent::MessageReceived {
                                         peer_id: 0,

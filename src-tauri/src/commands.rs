@@ -197,16 +197,20 @@ fn emit_queue_update(app: &AppHandle, queue: &[QueueItem]) {
     );
 
     // Broadcast queue update to all connected peers over TCP.
+    log::info!("[emit_queue_update] {} items, broadcasting to peers", queue.len());
     let tcp_host = state.host_tcp.lock().clone();
     if let Some(tcp_host) = tcp_host {
         let msg = Message::QueueUpdate { queue: queue.to_vec() };
         tokio::spawn(async move {
             tcp_host.broadcast(&msg).await;
         });
+    } else {
+        log::warn!("[emit_queue_update] host_tcp is None — queue update not sent to peers");
     }
 }
 
 fn emit_playback_state(app: &AppHandle, pstate: &str, file_name: &str, position_ms: u64, duration_ms: u64) {
+    log::info!("[emit_playback_state] state={pstate} file={file_name} pos={position_ms} dur={duration_ms}");
     let _ = app.emit(
         "playback:state-changed",
         PlaybackStatePayload {
@@ -238,10 +242,13 @@ fn broadcast_to_peers(app: &AppHandle, msg: &Message) {
     let state = app.state::<AppState>();
     let tcp_host = state.host_tcp.lock().clone();
     if let Some(tcp_host) = tcp_host {
+        log::info!("[broadcast_to_peers] Sending {:?}", std::mem::discriminant(msg));
         let msg = msg.clone();
         tokio::spawn(async move {
             tcp_host.broadcast(&msg).await;
         });
+    } else {
+        log::warn!("[broadcast_to_peers] host_tcp is None — cannot broadcast");
     }
 }
 
@@ -337,9 +344,11 @@ pub async fn create_session(
                                 Message::FileCacheReport { file_ids } => {
                                     // Peer told us what files it already has.
                                     // Transfer any queued tracks the peer is missing.
+                                    log::info!("[host] Received FileCacheReport from peer {peer_id} with {} cached file(s)", file_ids.len());
                                     let s = app_clone.state::<AppState>();
                                     let queue = s.queue.lock().await;
                                     let all_track_ids: Vec<Uuid> = queue.get_queue().iter().map(|q| q.id).collect();
+                                    log::info!("[host] Queue has {} track(s): {:?}", all_track_ids.len(), all_track_ids);
                                     drop(queue);
 
                                     let cached_set: std::collections::HashSet<Uuid> = file_ids.into_iter().collect();
@@ -348,9 +357,10 @@ pub async fn create_session(
                                         .collect();
 
                                     if !missing.is_empty() {
-                                        log::info!("Peer {peer_id} is missing {} file(s) — transferring", missing.len());
+                                        log::info!("[host] Peer {peer_id} is missing {} file(s): {:?}", missing.len(), missing);
                                         let tcp_host = s.host_tcp.lock().clone();
                                         let track_store = s.track_data.lock().await;
+                                        log::info!("[host] track_data has {} entries", track_store.len());
                                         if let Some(tcp_host) = tcp_host {
                                             let mut mgr = s.file_transfer_mgr.lock().await;
                                             for file_id in missing {
@@ -477,6 +487,7 @@ pub async fn join_session(
             {
                 let cache = state.file_cache.lock().await;
                 let cached_ids = cache.cached_ids();
+                log::info!("[join_session] Sending FileCacheReport to host with {} cached file(s): {:?}", cached_ids.len(), cached_ids);
                 peer_session.send_file_cache_report(cached_ids).await;
             }
 
@@ -516,12 +527,14 @@ pub async fn join_session(
                         crate::session::SessionEvent::MessageReceived { message, .. } => {
                             match message {
                                 Message::QueueUpdate { queue } => {
+                                    log::info!("[peer] Received QueueUpdate: {} item(s)", queue.len());
                                     let _ = app_clone.emit(
                                         "queue:updated",
                                         QueueUpdatedPayload { queue },
                                     );
                                 }
                                 Message::PlaybackStateUpdate { state, file_name, position_ms, duration_ms } => {
+                                    log::info!("[peer] Received PlaybackStateUpdate: state={state} file={file_name} pos={position_ms} dur={duration_ms}");
                                     let _ = app_clone.emit(
                                         "playback:state-changed",
                                         PlaybackStatePayload {
@@ -533,6 +546,7 @@ pub async fn join_session(
                                     );
                                 }
                                 Message::FileTransferStart { file_id, file_name, size, sha256 } => {
+                                    log::info!("[peer] Received FileTransferStart: id={file_id} name={file_name} size={size}");
                                     let s = app_clone.state::<AppState>();
                                     let mut receiver = s.file_receiver.lock().await;
                                     if let Err(e) = receiver.handle_transfer_start(file_id, file_name.clone(), size, sha256) {
@@ -540,6 +554,7 @@ pub async fn join_session(
                                     }
                                 }
                                 Message::FileChunk { file_id, offset, data } => {
+                                    log::debug!("[peer] Received FileChunk: id={file_id} offset={offset} chunk_len={}", data.len());
                                     let s = app_clone.state::<AppState>();
                                     let mut receiver = s.file_receiver.lock().await;
                                     if let Some((event, response)) = receiver.handle_chunk(file_id, offset, &data) {
@@ -560,6 +575,7 @@ pub async fn join_session(
                                     }
                                 }
                                 Message::PlayCommand { file_id, position_samples, .. } => {
+                                    log::info!("[peer] Received PlayCommand: file_id={file_id} position_samples={position_samples}");
                                     let s = app_clone.state::<AppState>();
                                     // Look up file data from cache.
                                     let file_data = {
@@ -567,6 +583,7 @@ pub async fn join_session(
                                         cache.get(&file_id).cloned()
                                     };
                                     if let Some(file_bytes) = file_data {
+                                        log::info!("[peer] Found file {file_id} in cache ({} bytes), decoding...", file_bytes.len());
                                         // Decode and play.
                                         match tokio::task::spawn_blocking(move || {
                                             crate::audio::decoder::decode_mp3(&file_bytes)
@@ -1091,6 +1108,7 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
 
             // Transfer the file to all connected peers.
             let peer_ids: Vec<u32> = host.peers.lock().keys().copied().collect();
+            log::info!("[add_song] track_id={track_id} file={file_name} size={} peers={:?}", file_data.len(), peer_ids);
             if !peer_ids.is_empty() {
                 let tcp_host = host.tcp_host.clone();
                 let mut mgr = state.file_transfer_mgr.lock().await;

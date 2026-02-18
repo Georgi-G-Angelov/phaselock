@@ -12,6 +12,7 @@
     $: hasTrack = $playbackStore.file_name !== '';
     $: isPlaying = $playbackStore.state === 'playing';
     $: isPaused = $playbackStore.state === 'paused';
+    $: console.log('[NowPlaying] playbackStore updated:', $playbackStore, 'hasTrack:', hasTrack);
     $: progress = $playbackStore.duration_ms > 0
         ? ($playbackStore.position_ms / $playbackStore.duration_ms) * 100
         : 0;
