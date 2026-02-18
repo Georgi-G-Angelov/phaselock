@@ -59,12 +59,19 @@
         }
     }
 
-    function handleDragStart(i: number) {
+    function handleDragStart(e: DragEvent, i: number) {
         dragIndex = i;
+        if (e.dataTransfer) {
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', String(i));
+        }
     }
 
     function handleDragOver(e: DragEvent, i: number) {
         e.preventDefault();
+        if (e.dataTransfer) {
+            e.dataTransfer.dropEffect = 'move';
+        }
         dropIndex = i;
     }
 
@@ -116,7 +123,12 @@
             {/if}
         </div>
     {:else}
-        <div class="queue-list flex-col gap-1 overflow-y-auto">
+        <div
+            class="queue-list flex-col gap-1 overflow-y-auto"
+            role="list"
+            on:dragover|preventDefault
+            on:drop|preventDefault
+        >
             {#each $queueStore as item, i (item.id)}
                 <div
                     class="queue-item flex items-center gap-2 p-2"
@@ -124,7 +136,7 @@
                     class:is-dragging={dragIndex === i}
                     class:drop-target={dropIndex === i}
                     draggable={editable ? 'true' : 'false'}
-                    on:dragstart={() => handleDragStart(i)}
+                    on:dragstart={(e) => handleDragStart(e, i)}
                     on:dragover={(e) => handleDragOver(e, i)}
                     on:dragleave={handleDragLeave}
                     on:drop={(e) => handleDrop(e, i)}
