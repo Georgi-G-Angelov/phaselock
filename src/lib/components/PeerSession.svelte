@@ -64,12 +64,9 @@
         }
     }
 
-    async function leaveJam() {
-        try {
-            await invoke('leave_session');
-        } catch (e) {
-            console.error('Failed to leave session:', e);
-        }
+    function leaveJam() {
+        // Fire-and-forget backend cleanup — navigate immediately.
+        invoke('leave_session').catch(e => console.error('Failed to leave session:', e));
         sessionStore.set(null);
         peersStore.set([]);
         queueStore.set([]);
