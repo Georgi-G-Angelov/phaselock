@@ -269,16 +269,35 @@ impl AudioOutput {
 
     /// Load a decoded track into the playback buffer.
     /// Stops any current playback first.
+    /// If the track sample rate differs from the device, the audio is resampled.
     pub fn load_track(&self, decoded: DecodedAudio) {
         self.state.state.store(STATE_STOPPED, Ordering::Release);
         self.state.position.store(0, Ordering::Release);
 
+        let channels = decoded.channels;
+        let final_samples;
+        let final_sample_rate;
+        let final_frames;
+
         if decoded.sample_rate != self.device_sample_rate {
-            log::warn!(
-                "Sample rate mismatch: track={} Hz, device={} Hz — playback may sound wrong",
+            log::info!(
+                "Resampling track from {} Hz to {} Hz ({} ch)",
                 decoded.sample_rate,
-                self.device_sample_rate
+                self.device_sample_rate,
+                channels,
             );
+            final_samples = Self::resample(
+                &decoded.samples,
+                channels,
+                decoded.sample_rate,
+                self.device_sample_rate,
+            );
+            final_sample_rate = self.device_sample_rate;
+            final_frames = final_samples.len() as u64 / channels as u64;
+        } else {
+            final_samples = decoded.samples;
+            final_sample_rate = decoded.sample_rate;
+            final_frames = decoded.total_frames;
         }
 
         if decoded.channels != self.device_channels {
@@ -290,15 +309,40 @@ impl AudioOutput {
         }
 
         // Safely swap the buffer, sample rate, and channels using interior mutability.
-        *self.state.buffer.lock() = Arc::new(decoded.samples);
-        self.state.sample_rate.store(decoded.sample_rate, Ordering::Release);
+        *self.state.buffer.lock() = Arc::new(final_samples);
+        self.state.sample_rate.store(final_sample_rate, Ordering::Release);
         self.state.channels.store(decoded.channels, Ordering::Release);
         log::info!(
             "Loaded track: {} Hz, {} ch, {} frames",
-            decoded.sample_rate,
+            final_sample_rate,
             decoded.channels,
-            decoded.total_frames
+            final_frames
         );
+    }
+
+    /// Resample interleaved audio from `src_rate` to `dst_rate` using linear interpolation.
+    fn resample(samples: &[f32], channels: u16, src_rate: u32, dst_rate: u32) -> Vec<f32> {
+        let ch = channels as usize;
+        let src_frames = samples.len() / ch;
+        let dst_frames = ((src_frames as f64) * (dst_rate as f64) / (src_rate as f64)).ceil() as usize;
+        let mut out = Vec::with_capacity(dst_frames * ch);
+
+        let ratio = src_rate as f64 / dst_rate as f64;
+
+        for dst_frame in 0..dst_frames {
+            let src_pos = dst_frame as f64 * ratio;
+            let idx0 = src_pos.floor() as usize;
+            let frac = (src_pos - idx0 as f64) as f32;
+            let idx1 = (idx0 + 1).min(src_frames - 1);
+
+            for c in 0..ch {
+                let s0 = samples[idx0 * ch + c];
+                let s1 = samples[idx1 * ch + c];
+                out.push(s0 + (s1 - s0) * frac);
+            }
+        }
+
+        out
     }
 
     /// Schedule playback to start at a precise instant.

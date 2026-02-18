@@ -897,11 +897,15 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
     drop(audio);
 
     // Update shared current track state for new peer joins.
+    let actual_sample_rate = {
+        let audio = state.audio_output.lock().await;
+        audio.as_ref().map(|ao| ao.playback_state().sample_rate.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(44100)
+    };
     *state.host_current_track.lock() = Some(CurrentTrack {
         file_id: track_id,
         file_name: file_name.clone(),
         position_samples: 0,
-        sample_rate: 44100,
+        sample_rate: actual_sample_rate,
         is_playing: true,
     });
 
