@@ -1,3 +1,4 @@
+use crate::audio::decoder::DecodedAudio;
 use crate::audio::playback::AudioOutput;
 use crate::network::mdns::{DiscoveredSession, MdnsBrowser};
 use crate::network::messages::{CurrentTrack, Message, QueueItem};
@@ -149,6 +150,8 @@ pub struct AppState {
     pub file_transfer_mgr: Mutex<FileTransferManager>,
     /// Peer-side file receiver — reassembles incoming file chunks.
     pub file_receiver: Mutex<FileReceiver>,
+    /// Peer-side decoded audio cache — pre-decoded tracks ready for instant playback.
+    pub decoded_cache: Mutex<HashMap<Uuid, DecodedAudio>>,
 }
 
 impl AppState {
@@ -168,6 +171,7 @@ impl AppState {
             host_tcp: ParkingMutex::new(None),
             file_transfer_mgr: Mutex::new(FileTransferManager::new()),
             file_receiver: Mutex::new(FileReceiver::new()),
+            decoded_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -564,6 +568,26 @@ pub async fn join_session(
                                                 let mut cache = s.file_cache.lock().await;
                                                 cache.insert(*file_id, file_data.clone());
                                                 log::info!("Cached received file \"{file_name}\" ({file_id})");
+
+                                                // Pre-decode in background so PlayCommand is instant.
+                                                let fid = *file_id;
+                                                let fname = file_name.clone();
+                                                let bytes = file_data.clone();
+                                                let app_for_decode = app_clone.clone();
+                                                tokio::spawn(async move {
+                                                    log::info!("[peer] Pre-decoding \"{fname}\" ({fid})...");
+                                                    match tokio::task::spawn_blocking(move || {
+                                                        crate::audio::decoder::decode_mp3(&bytes)
+                                                    }).await {
+                                                        Ok(Ok(decoded)) => {
+                                                            let st = app_for_decode.state::<AppState>();
+                                                            st.decoded_cache.lock().await.insert(fid, decoded);
+                                                            log::info!("[peer] Pre-decoded \"{fname}\" ({fid}) — ready for instant playback");
+                                                        }
+                                                        Ok(Err(e)) => log::warn!("[peer] Pre-decode of \"{fname}\" failed: {e}"),
+                                                        Err(e) => log::warn!("[peer] Pre-decode task of \"{fname}\" failed: {e}"),
+                                                    }
+                                                });
                                             }
                                         }
                                         // Send FileReceived confirmation back to host.
@@ -577,43 +601,57 @@ pub async fn join_session(
                                 Message::PlayCommand { file_id, position_samples, .. } => {
                                     log::info!("[peer] Received PlayCommand: file_id={file_id} position_samples={position_samples}");
                                     let s = app_clone.state::<AppState>();
-                                    // Look up file data from cache.
-                                    let file_data = {
-                                        let cache = s.file_cache.lock().await;
-                                        cache.get(&file_id).cloned()
+
+                                    // Try pre-decoded cache first (instant playback).
+                                    let pre_decoded = {
+                                        let mut dc = s.decoded_cache.lock().await;
+                                        dc.remove(&file_id)
                                     };
-                                    if let Some(file_bytes) = file_data {
-                                        log::info!("[peer] Found file {file_id} in cache ({} bytes), decoding...", file_bytes.len());
-                                        // Decode and play.
-                                        match tokio::task::spawn_blocking(move || {
-                                            crate::audio::decoder::decode_mp3(&file_bytes)
-                                        }).await {
-                                            Ok(Ok(decoded)) => {
-                                                let mut audio = s.audio_output.lock().await;
-                                                if audio.is_none() {
-                                                    match AudioOutput::new() {
-                                                        Ok(ao) => { *audio = Some(ao); }
-                                                        Err(e) => {
-                                                            log::error!("Failed to init peer audio: {e}");
-                                                            continue;
-                                                        }
-                                                    }
-                                                }
-                                                let ao = audio.as_ref().unwrap();
-                                                let vol = *s.volume.lock();
-                                                ao.set_volume(vol);
-                                                ao.load_track(decoded);
-                                                if position_samples > 0 {
-                                                    ao.seek(position_samples);
-                                                }
-                                                ao.play_at(std::time::Instant::now());
-                                                log::info!("Peer: playing file {file_id}");
-                                            }
-                                            Ok(Err(e)) => log::error!("Peer: failed to decode MP3: {e}"),
-                                            Err(e) => log::error!("Peer: decode task failed: {e}"),
-                                        }
+
+                                    let decoded = if let Some(d) = pre_decoded {
+                                        log::info!("[peer] Using pre-decoded audio for {file_id}");
+                                        Some(d)
                                     } else {
-                                        log::warn!("Peer: PlayCommand for unknown file {file_id} — not in cache");
+                                        // Fall back to decoding from raw cache.
+                                        let file_data = {
+                                            let cache = s.file_cache.lock().await;
+                                            cache.get(&file_id).cloned()
+                                        };
+                                        if let Some(file_bytes) = file_data {
+                                            log::info!("[peer] No pre-decoded audio for {file_id}, decoding {} bytes...", file_bytes.len());
+                                            match tokio::task::spawn_blocking(move || {
+                                                crate::audio::decoder::decode_mp3(&file_bytes)
+                                            }).await {
+                                                Ok(Ok(d)) => Some(d),
+                                                Ok(Err(e)) => { log::error!("Peer: failed to decode MP3: {e}"); None }
+                                                Err(e) => { log::error!("Peer: decode task failed: {e}"); None }
+                                            }
+                                        } else {
+                                            log::warn!("Peer: PlayCommand for unknown file {file_id} — not in cache");
+                                            None
+                                        }
+                                    };
+
+                                    if let Some(decoded) = decoded {
+                                        let mut audio = s.audio_output.lock().await;
+                                        if audio.is_none() {
+                                            match AudioOutput::new() {
+                                                Ok(ao) => { *audio = Some(ao); }
+                                                Err(e) => {
+                                                    log::error!("Failed to init peer audio: {e}");
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        let ao = audio.as_ref().unwrap();
+                                        let vol = *s.volume.lock();
+                                        ao.set_volume(vol);
+                                        ao.load_track(decoded);
+                                        if position_samples > 0 {
+                                            ao.seek(position_samples);
+                                        }
+                                        ao.play_at(std::time::Instant::now());
+                                        log::info!("Peer: playing file {file_id}");
                                     }
                                 }
                                 Message::PauseCommand { position_samples } => {
