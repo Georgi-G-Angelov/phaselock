@@ -35,17 +35,17 @@ pub enum TcpEvent {
 
 // ── TcpHost ─────────────────────────────────────────────────────────────────
 
-/// A peer's write half plus metadata, stored in the host's connection map.
-struct PeerConnection {
+/// A sender that serialises outgoing messages for one peer.
+/// The actual writing happens in a dedicated per-peer task.
+#[derive(Clone)]
+struct PeerSender {
+    tx: mpsc::Sender<Message>,
     pub display_name: String,
-    pub writer: OwnedWriteHalf,
-    #[allow(dead_code)]
-    pub connected_at: Instant,
 }
 
 /// Host-side TCP server: accepts connections, reads/writes framed messages.
 pub struct TcpHost {
-    connections: Arc<Mutex<HashMap<u32, PeerConnection>>>,
+    senders: Arc<Mutex<HashMap<u32, PeerSender>>>,
     next_peer_id: Arc<Mutex<u32>>,
     /// Handle to the accept-loop task so we can abort on shutdown.
     accept_handle: Option<tokio::task::JoinHandle<()>>,
@@ -63,12 +63,12 @@ impl TcpHost {
         let local_addr = listener.local_addr()?;
         log::info!("TCP host listening on {local_addr}");
 
-        let connections: Arc<Mutex<HashMap<u32, PeerConnection>>> =
+        let senders: Arc<Mutex<HashMap<u32, PeerSender>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let next_peer_id = Arc::new(Mutex::new(1u32));
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
-        let conns = connections.clone();
+        let senders_clone = senders.clone();
         let next_id = next_peer_id.clone();
         let sd_tx = shutdown_tx.clone();
 
@@ -93,14 +93,26 @@ impl TcpHost {
 
                 let (reader, writer) = stream.into_split();
 
+                // Spawn a per-peer writer task that serialises all outgoing messages.
+                let (write_tx, mut write_rx) = mpsc::channel::<Message>(128);
+                tokio::spawn(async move {
+                    let mut writer = writer;
+                    while let Some(msg) = write_rx.recv().await {
+                        if let Err(e) = write_message(&mut writer, &msg).await {
+                            log::info!("Peer {peer_id}: write error: {e}");
+                            break;
+                        }
+                    }
+                    log::debug!("Peer {peer_id}: writer task exiting");
+                });
+
                 {
-                    let mut map = conns.lock();
+                    let mut map = senders_clone.lock();
                     map.insert(
                         peer_id,
-                        PeerConnection {
+                        PeerSender {
+                            tx: write_tx,
                             display_name: String::new(),
-                            writer,
-                            connected_at: Instant::now(),
                         },
                     );
                 }
@@ -111,7 +123,7 @@ impl TcpHost {
 
                 // Spawn reader + heartbeat-timeout task for this peer.
                 let ev_tx = event_tx.clone();
-                let conns2 = conns.clone();
+                let senders_ref = senders_clone.clone();
                 let mut sd_rx = sd_tx.subscribe();
 
                 tokio::spawn(async move {
@@ -148,7 +160,7 @@ impl TcpHost {
                                     peer_id,
                                     reason: "heartbeat timeout".into(),
                                 }).await;
-                                conns2.lock().remove(&peer_id);
+                                senders_ref.lock().remove(&peer_id);
                                 return;
                             }
                             _ = sd_rx.recv() => {
@@ -165,13 +177,13 @@ impl TcpHost {
                             reason: "disconnected".into(),
                         })
                         .await;
-                    conns2.lock().remove(&peer_id);
+                    senders_ref.lock().remove(&peer_id);
                 });
             }
         });
 
         Ok(Self {
-            connections,
+            senders,
             next_peer_id,
             accept_handle: Some(accept_handle),
             shutdown_tx,
@@ -180,68 +192,60 @@ impl TcpHost {
 
     /// Send a message to a specific peer. Returns false if the peer is gone.
     pub async fn send_to_peer(&self, peer_id: u32, msg: &Message) -> bool {
-        // Take the writer out briefly — we need &mut and can't hold the mutex
-        // across an await, so we remove, write, then re-insert.
-        let mut writer = {
-            let mut map = self.connections.lock();
-            match map.remove(&peer_id) {
-                Some(conn) => (conn.display_name.clone(), conn.writer, conn.connected_at),
-                None => return false,
-            }
+        let sender = {
+            let map = self.senders.lock();
+            map.get(&peer_id).cloned()
         };
 
-        let success = write_message(&mut writer.1, msg).await.is_ok();
-
-        if success {
-            log::debug!("Sent to peer {peer_id}: {msg:?}");
-            let mut map = self.connections.lock();
-            map.insert(
-                peer_id,
-                PeerConnection {
-                    display_name: writer.0,
-                    writer: writer.1,
-                    connected_at: writer.2,
-                },
-            );
-        } else {
-            log::info!("Failed to send to peer {peer_id}, dropping connection");
+        match sender {
+            Some(s) => {
+                if s.tx.send(msg.clone()).await.is_ok() {
+                    log::debug!("Queued message for peer {peer_id}");
+                    true
+                } else {
+                    log::info!("Peer {peer_id} writer channel closed, dropping connection");
+                    self.senders.lock().remove(&peer_id);
+                    false
+                }
+            }
+            None => false,
         }
-
-        success
     }
 
     /// Broadcast a message to all connected peers.
     pub async fn broadcast(&self, msg: &Message) {
-        let peer_ids: Vec<u32> = {
-            let map = self.connections.lock();
-            map.keys().copied().collect()
+        let senders: Vec<(u32, PeerSender)> = {
+            let map = self.senders.lock();
+            map.iter().map(|(&id, s)| (id, s.clone())).collect()
         };
-        log::info!("[TcpHost::broadcast] Sending to {} peer(s): {:?}", peer_ids.len(), peer_ids);
-        for pid in peer_ids {
-            self.send_to_peer(pid, msg).await;
+        log::info!("[TcpHost::broadcast] Sending to {} peer(s): {:?}", senders.len(), senders.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+        for (pid, sender) in senders {
+            if sender.tx.send(msg.clone()).await.is_err() {
+                log::info!("Peer {pid} writer channel closed during broadcast");
+                self.senders.lock().remove(&pid);
+            }
         }
     }
 
     /// Disconnect and remove a peer.
     pub fn disconnect_peer(&self, peer_id: u32) {
-        let removed = self.connections.lock().remove(&peer_id);
-        if let Some(mut conn) = removed {
-            // Shutdown the write half so the remote reader gets EOF.
-            let _ = conn.writer.shutdown();
+        // Dropping the PeerSender closes the channel, which causes the writer task to exit.
+        let removed = self.senders.lock().remove(&peer_id);
+        if removed.is_some() {
             log::info!("Peer {peer_id} disconnected by host");
         }
     }
 
     /// Update a peer's display name (called when JoinRequest is processed).
     pub fn set_peer_name(&self, peer_id: u32, name: String) {
-        if let Some(conn) = self.connections.lock().get_mut(&peer_id) {
-            conn.display_name = name;
+        if let Some(sender) = self.senders.lock().get_mut(&peer_id) {
+            sender.display_name = name;
         }
     }
 
     /// Returns the list of currently connected peer IDs.
     pub fn connected_peer_ids(&self) -> Vec<u32> {
-        self.connections.lock().keys().copied().collect()
+        self.senders.lock().keys().copied().collect()
     }
 
     /// Start a background task that sends heartbeats to all peers at a fixed interval.
@@ -267,9 +271,9 @@ impl TcpHost {
             handle.abort();
         }
         let _ = self.shutdown_tx.send(());
-        let mut map = self.connections.lock();
-        for (pid, mut conn) in map.drain() {
-            let _ = conn.writer.shutdown();
+        // Dropping all PeerSenders closes their channels, causing writer tasks to exit.
+        let mut map = self.senders.lock();
+        for (pid, _) in map.drain() {
             log::info!("Peer {pid} disconnected (host shutdown)");
         }
     }
