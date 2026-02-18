@@ -1,10 +1,13 @@
 <script lang="ts">
     import { invoke } from '@tauri-apps/api/core';
+    import { createEventDispatcher } from 'svelte';
     import { playbackStore } from '../stores/playback';
     import { queueStore } from '../stores/queue';
 
     /** Whether to show host transport controls. */
     export let hostControls: boolean = false;
+
+    const dispatch = createEventDispatcher<{ 'toast-message': { message: string; variant: 'success' | 'error' | 'info' } }>();
 
     $: hasTrack = $playbackStore.file_name !== '';
     $: isPlaying = $playbackStore.state === 'playing';
@@ -14,6 +17,7 @@
         : 0;
     $: anyTransferring = $queueStore.some(q => q.status === 'Transferring');
     $: hasReadyTracks = $queueStore.some(q => q.status === 'Ready');
+    $: canPlay = hasTrack || hasReadyTracks;
 
     function formatTime(ms: number): string {
         const totalSec = Math.floor(ms / 1000);
@@ -32,29 +36,39 @@
     }
 
     async function togglePlay() {
-        if (isPlaying) {
-            await invoke('pause');
-        } else {
-            await invoke('play');
+        try {
+            if (isPlaying) {
+                await invoke('pause');
+            } else {
+                await invoke('play');
+            }
+        } catch (e) {
+            dispatch('toast-message', { message: `${e}`, variant: 'error' });
         }
+    }
+
+    async function handleStop() {
+        try { await invoke('stop'); } catch (e) { dispatch('toast-message', { message: `${e}`, variant: 'error' }); }
+    }
+
+    async function handleSkip() {
+        try { await invoke('skip'); } catch (e) { dispatch('toast-message', { message: `${e}`, variant: 'error' }); }
     }
 </script>
 
 <div class="now-playing card flex-col gap-4">
     <h4>Now Playing</h4>
 
-    {#if !hasTrack && $playbackStore.state === 'stopped'}
-        <p class="text-secondary text-sm">{hostControls ? 'No track playing' : 'Waiting for host to play a track...'}</p>
-    {:else}
+    {#if hasTrack}
         <div class="track-info flex-col gap-1">
-            <span class="track-name text-ellipsis">{$playbackStore.file_name || 'Unknown'}</span>
+            <span class="track-name text-ellipsis">{$playbackStore.file_name}</span>
         </div>
 
         <!-- Progress bar -->
         <div class="progress-section flex-col gap-1">
             <button
                 class="progress-bar"
-                class:seekable={hostControls && hasTrack}
+                class:seekable={hostControls}
                 on:click={handleSeek}
                 aria-label="Seek"
             >
@@ -65,35 +79,37 @@
                 <span class="text-xs text-secondary">{formatTime($playbackStore.duration_ms)}</span>
             </div>
         </div>
+    {:else}
+        <p class="text-secondary text-sm">{hostControls ? 'Add songs to the queue, then press play.' : 'Waiting for host to play a track...'}</p>
+    {/if}
 
-        <!-- Transport controls (host only) -->
-        {#if hostControls}
-            <div class="transport-controls flex-center gap-3">
-                <button
-                    class="btn-icon"
-                    aria-label="Stop"
-                    on:click={() => invoke('stop')}
-                    disabled={!hasTrack}
-                >⏹</button>
+    <!-- Transport controls (host only) — always visible -->
+    {#if hostControls}
+        <div class="transport-controls flex-center gap-3">
+            <button
+                class="btn-icon"
+                aria-label="Stop"
+                on:click={handleStop}
+                disabled={!hasTrack}
+            >⏹</button>
 
-                <button
-                    class="btn-icon large"
-                    aria-label={isPlaying ? 'Pause' : 'Play'}
-                    on:click={togglePlay}
-                    disabled={(!hasTrack && !hasReadyTracks) || anyTransferring}
-                    title={anyTransferring ? 'Waiting for all peers to receive the file' : ''}
-                >
-                    {isPlaying ? '⏸' : '▶'}
-                </button>
+            <button
+                class="btn-icon large"
+                aria-label={isPlaying ? 'Pause' : 'Play'}
+                on:click={togglePlay}
+                disabled={!canPlay || anyTransferring}
+                title={anyTransferring ? 'Waiting for all peers to receive the file' : (!canPlay ? 'Add songs to the queue first' : '')}
+            >
+                {isPlaying ? '⏸' : '▶'}
+            </button>
 
-                <button
-                    class="btn-icon"
-                    aria-label="Skip"
-                    on:click={() => invoke('skip')}
-                    disabled={!hasTrack}
-                >⏭</button>
-            </div>
-        {/if}
+            <button
+                class="btn-icon"
+                aria-label="Skip"
+                on:click={handleSkip}
+                disabled={!hasTrack}
+            >⏭</button>
+        </div>
     {/if}
 </div>
 

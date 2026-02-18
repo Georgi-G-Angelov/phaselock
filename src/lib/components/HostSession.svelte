@@ -106,7 +106,7 @@
             <PeerList />
         </aside>
         <div class="panel-center flex-col flex-1 gap-4 p-4 overflow-y-auto">
-            <NowPlaying hostControls={true} />
+            <NowPlaying hostControls={true} on:toast-message={(e) => toast?.show(e.detail.message, e.detail.variant)} />
             <SongRequests />
         </div>
         <aside class="panel-right flex-col p-4 overflow-y-auto">

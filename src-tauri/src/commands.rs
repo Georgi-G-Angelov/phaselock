@@ -488,7 +488,7 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
             let duration_ms = (t.duration_secs * 1000.0) as u64;
             drop(queue);
 
-            let mut audio = state.audio_output.lock().await;
+            let audio = state.audio_output.lock().await;
             if let Some(ref ao) = *audio {
                 ao.resume_at(std::time::Instant::now());
             }

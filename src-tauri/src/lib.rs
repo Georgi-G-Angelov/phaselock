@@ -1,3 +1,8 @@
+// Many structs / methods are scaffolded for upcoming networked-playback
+// features but not yet wired into commands.  Silence the noise until they
+// are connected.
+#![allow(dead_code)]
+
 mod audio;
 mod commands;
 mod logging;
