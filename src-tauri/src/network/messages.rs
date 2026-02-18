@@ -36,6 +36,9 @@ pub enum Message {
     // Queue sync
     QueueUpdate { queue: Vec<QueueItem> },
 
+    // Playback state notification (host → peers, for UI sync)
+    PlaybackStateUpdate { state: String, file_name: String, position_ms: u64, duration_ms: u64 },
+
     // Reconnection
     /// Sent by a peer after joining to tell the host which files it already has cached.
     FileCacheReport { file_ids: Vec<Uuid> },

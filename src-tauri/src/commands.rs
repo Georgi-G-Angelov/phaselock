@@ -198,6 +198,33 @@ fn emit_queue_update(app: &AppHandle, queue: &[QueueItem]) {
     }
 }
 
+fn emit_playback_state(app: &AppHandle, pstate: &str, file_name: &str, position_ms: u64, duration_ms: u64) {
+    let _ = app.emit(
+        "playback:state-changed",
+        PlaybackStatePayload {
+            state: pstate.to_string(),
+            file_name: file_name.to_string(),
+            position_ms,
+            duration_ms,
+        },
+    );
+
+    // Broadcast to peers over TCP.
+    let state = app.state::<AppState>();
+    let tcp_host = state.host_tcp.lock().clone();
+    if let Some(tcp_host) = tcp_host {
+        let msg = Message::PlaybackStateUpdate {
+            state: pstate.to_string(),
+            file_name: file_name.to_string(),
+            position_ms,
+            duration_ms,
+        };
+        tokio::spawn(async move {
+            tcp_host.broadcast(&msg).await;
+        });
+    }
+}
+
 fn discovered_to_payload(d: &DiscoveredSession) -> DiscoveredSessionPayload {
     DiscoveredSessionPayload {
         session_name: d.session_name.clone(),
@@ -420,11 +447,25 @@ pub async fn join_session(
                             emit_error(&app_clone, &format!("Join rejected: {reason}"));
                         }
                         crate::session::SessionEvent::MessageReceived { message, .. } => {
-                            if let Message::QueueUpdate { queue } = message {
-                                let _ = app_clone.emit(
-                                    "queue:updated",
-                                    QueueUpdatedPayload { queue },
-                                );
+                            match message {
+                                Message::QueueUpdate { queue } => {
+                                    let _ = app_clone.emit(
+                                        "queue:updated",
+                                        QueueUpdatedPayload { queue },
+                                    );
+                                }
+                                Message::PlaybackStateUpdate { state, file_name, position_ms, duration_ms } => {
+                                    let _ = app_clone.emit(
+                                        "playback:state-changed",
+                                        PlaybackStatePayload {
+                                            state,
+                                            file_name,
+                                            position_ms,
+                                            duration_ms,
+                                        },
+                                    );
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -557,15 +598,7 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
             }
             drop(audio);
 
-            let _ = app.emit(
-                "playback:state-changed",
-                PlaybackStatePayload {
-                    state: "playing".into(),
-                    file_name,
-                    position_ms: 0,
-                    duration_ms,
-                },
-            );
+            emit_playback_state(app, "playing", &file_name, 0, duration_ms);
             return Ok(());
         }
         _ => {
@@ -631,15 +664,7 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
     drop(audio);
 
     // Emit state.
-    let _ = app.emit(
-        "playback:state-changed",
-        PlaybackStatePayload {
-            state: "playing".into(),
-            file_name: file_name.clone(),
-            position_ms: 0,
-            duration_ms,
-        },
-    );
+    emit_playback_state(app, "playing", &file_name, 0, duration_ms);
 
     // Start the position ticker.
     start_position_ticker(app, state, duration_ms).await;
@@ -676,15 +701,7 @@ pub async fn pause(app: AppHandle) -> Result<(), String> {
                 (0, String::new(), 0)
             };
 
-            let _ = app.emit(
-                "playback:state-changed",
-                PlaybackStatePayload {
-                    state: "paused".into(),
-                    file_name,
-                    position_ms,
-                    duration_ms,
-                },
-            );
+            emit_playback_state(&app, "paused", &file_name, position_ms, duration_ms);
             log::info!("Paused playback");
             Ok(())
         }
@@ -708,15 +725,7 @@ pub async fn stop(app: AppHandle) -> Result<(), String> {
             }
             drop(audio);
 
-            let _ = app.emit(
-                "playback:state-changed",
-                PlaybackStatePayload {
-                    state: "stopped".into(),
-                    file_name: String::new(),
-                    position_ms: 0,
-                    duration_ms: 0,
-                },
-            );
+            emit_playback_state(&app, "stopped", "", 0, 0);
             log::info!("Stopped playback");
             Ok(())
         }
@@ -791,15 +800,7 @@ pub async fn skip(app: AppHandle) -> Result<(), String> {
                 play_current_track(&app, &state).await?;
             } else {
                 log::info!("Skip: no more tracks");
-                let _ = app.emit(
-                    "playback:state-changed",
-                    PlaybackStatePayload {
-                        state: "stopped".into(),
-                        file_name: String::new(),
-                        position_ms: 0,
-                        duration_ms: 0,
-                    },
-                );
+                emit_playback_state(&app, "stopped", "", 0, 0);
             }
             Ok(())
         }
@@ -1048,15 +1049,7 @@ async fn auto_advance_to_next(app: AppHandle) {
         }
     } else {
         log::info!("Track finished — no more tracks in queue");
-        let _ = app.emit(
-            "playback:state-changed",
-            PlaybackStatePayload {
-                state: "stopped".into(),
-                file_name: String::new(),
-                position_ms: 0,
-                duration_ms: 0,
-            },
-        );
+        emit_playback_state(&app, "stopped", "", 0, 0);
     }
 }
 
