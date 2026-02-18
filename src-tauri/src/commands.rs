@@ -115,6 +115,7 @@ pub struct SessionInfoPayload {
     pub host_name: String,
     pub is_host: bool,
     pub peer_id: Option<u32>,
+    pub initial_queue: Vec<QueueItem>,
 }
 
 // ── App State ───────────────────────────────────────────────────────────────
@@ -238,6 +239,7 @@ pub async fn create_session(
                 session_name: host_session.session_name.clone(),
                 host_name: host_session.host_display_name.clone(),
                 is_host: true,
+                initial_queue: Vec::new(),
                 peer_id: None,
             };
 
@@ -318,11 +320,13 @@ pub async fn join_session(
 
     match PeerSession::join(tcp_addr, udp_addr, display_name.clone(), false).await {
         Ok((mut peer_session, mut event_rx)) => {
+            let initial_queue = peer_session.get_queue();
             let info = SessionInfoPayload {
                 session_name: peer_session.session_name.clone(),
                 host_name: peer_session.host_name.clone(),
                 is_host: false,
                 peer_id: Some(peer_session.peer_id),
+                initial_queue: initial_queue.clone(),
             };
 
             // Emit initial queue from session state.

@@ -27,6 +27,7 @@ export interface SessionInfo {
   host_name: string;
   is_host: boolean;
   peer_id: number | null;
+  initial_queue: QueueItem[];
 }
 
 export interface PlaybackState {

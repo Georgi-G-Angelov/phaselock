@@ -5,6 +5,7 @@
     import type { UnlistenFn } from '@tauri-apps/api/event';
     import { discoveredSessions } from '../stores/discovery';
     import { sessionStore, isHost } from '../stores/session';
+    import { queueStore } from '../stores/queue';
     import type { DiscoveredSession, SessionInfo } from '../types';
     import { EVENTS } from '../types';
     import Spinner from './Spinner.svelte';
@@ -71,6 +72,9 @@
             });
             sessionStore.set(info);
             isHost.set(false);
+            if (info.initial_queue && info.initial_queue.length > 0) {
+                queueStore.set(info.initial_queue);
+            }
             dispatch('joined');
         } catch (e) {
             toast?.show(String(e), 'error');
