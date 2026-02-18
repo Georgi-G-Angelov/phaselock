@@ -70,10 +70,14 @@
                 address,
                 displayName: displayName.trim(),
             });
+            console.log('[PhaseLock] join_session response:', JSON.stringify(info));
             sessionStore.set(info);
             isHost.set(false);
             if (info.initial_queue && info.initial_queue.length > 0) {
+                console.log('[PhaseLock] Setting initial queue with', info.initial_queue.length, 'items');
                 queueStore.set(info.initial_queue);
+            } else {
+                console.log('[PhaseLock] initial_queue is empty or missing:', info.initial_queue);
             }
             dispatch('joined');
         } catch (e) {

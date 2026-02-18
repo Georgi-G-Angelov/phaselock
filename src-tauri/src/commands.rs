@@ -338,6 +338,10 @@ pub async fn join_session(
     match PeerSession::join(tcp_addr, udp_addr, display_name.clone(), false).await {
         Ok((mut peer_session, mut event_rx)) => {
             let initial_queue = peer_session.get_queue();
+            log::info!("join_session: peer has {} items in initial queue", initial_queue.len());
+            for item in &initial_queue {
+                log::info!("  queue item: {} - {:?}", item.file_name, item.status);
+            }
             let info = SessionInfoPayload {
                 session_name: peer_session.session_name.clone(),
                 host_name: peer_session.host_name.clone(),
