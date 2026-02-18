@@ -143,6 +143,20 @@ impl FileTransferManager {
         peer_ids: &[u32],
         tcp_host: &Arc<TcpHost>,
     ) -> Result<Uuid, TransferError> {
+        let file_id = Uuid::new_v4();
+        self.start_transfer_with_id(file_id, file_name, file_data, peer_ids, tcp_host).await
+    }
+
+    /// Start transferring raw bytes with a specific file_id.
+    /// Useful when the ID must match the queue track ID.
+    pub async fn start_transfer_with_id(
+        &mut self,
+        file_id: Uuid,
+        file_name: String,
+        file_data: Vec<u8>,
+        peer_ids: &[u32],
+        tcp_host: &Arc<TcpHost>,
+    ) -> Result<Uuid, TransferError> {
         if file_data.is_empty() {
             return Err(TransferError::FileEmpty);
         }
@@ -151,7 +165,6 @@ impl FileTransferManager {
         }
 
         let sha256 = compute_sha256(&file_data);
-        let file_id = Uuid::new_v4();
 
         if self.active_transfers.contains_key(&file_id) {
             return Err(TransferError::AlreadyTransferring(file_id));

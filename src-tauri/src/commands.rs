@@ -2,9 +2,11 @@ use crate::audio::playback::AudioOutput;
 use crate::network::mdns::{DiscoveredSession, MdnsBrowser};
 use crate::network::messages::{CurrentTrack, Message, QueueItem};
 use crate::network::tcp::TcpHost;
+use crate::network::udp::now_ns;
 use crate::queue::manager::QueueManager;
 use crate::session::Session;
 use crate::transfer::file_cache::FileCache;
+use crate::transfer::file_transfer::{FileReceiver, FileTransferManager};
 use crate::transfer::song_request::SongRequestManager;
 use parking_lot::Mutex as ParkingMutex;
 use serde::Serialize;
@@ -143,6 +145,10 @@ pub struct AppState {
     pub track_data: Mutex<HashMap<Uuid, Vec<u8>>>,
     /// Host's TCP handle — used to broadcast queue/playback updates to peers.
     pub host_tcp: ParkingMutex<Option<Arc<TcpHost>>>,
+    /// Host-side file transfer manager — sends files to peers.
+    pub file_transfer_mgr: Mutex<FileTransferManager>,
+    /// Peer-side file receiver — reassembles incoming file chunks.
+    pub file_receiver: Mutex<FileReceiver>,
 }
 
 impl AppState {
@@ -160,6 +166,8 @@ impl AppState {
             audio_output: Mutex::new(None),
             track_data: Mutex::new(HashMap::new()),
             host_tcp: ParkingMutex::new(None),
+            file_transfer_mgr: Mutex::new(FileTransferManager::new()),
+            file_receiver: Mutex::new(FileReceiver::new()),
         }
     }
 }
@@ -219,6 +227,18 @@ fn emit_playback_state(app: &AppHandle, pstate: &str, file_name: &str, position_
             position_ms,
             duration_ms,
         };
+        tokio::spawn(async move {
+            tcp_host.broadcast(&msg).await;
+        });
+    }
+}
+
+/// Broadcast any message to all connected peers (no-op if not host).
+fn broadcast_to_peers(app: &AppHandle, msg: &Message) {
+    let state = app.state::<AppState>();
+    let tcp_host = state.host_tcp.lock().clone();
+    if let Some(tcp_host) = tcp_host {
+        let msg = msg.clone();
         tokio::spawn(async move {
             tcp_host.broadcast(&msg).await;
         });
@@ -465,6 +485,108 @@ pub async fn join_session(
                                         },
                                     );
                                 }
+                                Message::FileTransferStart { file_id, file_name, size, sha256 } => {
+                                    let s = app_clone.state::<AppState>();
+                                    let mut receiver = s.file_receiver.lock().await;
+                                    if let Err(e) = receiver.handle_transfer_start(file_id, file_name.clone(), size, sha256) {
+                                        log::warn!("Failed to start receiving file \"{file_name}\": {e}");
+                                    }
+                                }
+                                Message::FileChunk { file_id, offset, data } => {
+                                    let s = app_clone.state::<AppState>();
+                                    let mut receiver = s.file_receiver.lock().await;
+                                    if let Some((event, response)) = receiver.handle_chunk(file_id, offset, &data) {
+                                        // Store completed file in the file cache.
+                                        if let crate::transfer::file_transfer::TransferEvent::FileReady { file_id, file_name } = &event {
+                                            if let Some(file_data) = receiver.get_file(*file_id) {
+                                                let mut cache = s.file_cache.lock().await;
+                                                cache.insert(*file_id, file_data.clone());
+                                                log::info!("Cached received file \"{file_name}\" ({file_id})");
+                                            }
+                                        }
+                                        // Send FileReceived confirmation back to host.
+                                        drop(receiver);
+                                        let mut session = s.session.lock().await;
+                                        if let Session::Peer(ref mut peer) = &mut *session {
+                                            let _ = peer.send(&response).await;
+                                        }
+                                    }
+                                }
+                                Message::PlayCommand { file_id, position_samples, .. } => {
+                                    let s = app_clone.state::<AppState>();
+                                    // Look up file data from cache.
+                                    let file_data = {
+                                        let cache = s.file_cache.lock().await;
+                                        cache.get(&file_id).cloned()
+                                    };
+                                    if let Some(file_bytes) = file_data {
+                                        // Decode and play.
+                                        match tokio::task::spawn_blocking(move || {
+                                            crate::audio::decoder::decode_mp3(&file_bytes)
+                                        }).await {
+                                            Ok(Ok(decoded)) => {
+                                                let mut audio = s.audio_output.lock().await;
+                                                if audio.is_none() {
+                                                    match AudioOutput::new() {
+                                                        Ok(ao) => { *audio = Some(ao); }
+                                                        Err(e) => {
+                                                            log::error!("Failed to init peer audio: {e}");
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                                let ao = audio.as_ref().unwrap();
+                                                let vol = *s.volume.lock();
+                                                ao.set_volume(vol);
+                                                ao.load_track(decoded);
+                                                if position_samples > 0 {
+                                                    ao.seek(position_samples);
+                                                }
+                                                ao.play_at(std::time::Instant::now());
+                                                log::info!("Peer: playing file {file_id}");
+                                            }
+                                            Ok(Err(e)) => log::error!("Peer: failed to decode MP3: {e}"),
+                                            Err(e) => log::error!("Peer: decode task failed: {e}"),
+                                        }
+                                    } else {
+                                        log::warn!("Peer: PlayCommand for unknown file {file_id} — not in cache");
+                                    }
+                                }
+                                Message::PauseCommand { position_samples } => {
+                                    let s = app_clone.state::<AppState>();
+                                    let audio = s.audio_output.lock().await;
+                                    if let Some(ref ao) = *audio {
+                                        ao.seek(position_samples);
+                                        ao.pause();
+                                        log::info!("Peer: paused at sample {position_samples}");
+                                    }
+                                }
+                                Message::StopCommand => {
+                                    let s = app_clone.state::<AppState>();
+                                    let audio = s.audio_output.lock().await;
+                                    if let Some(ref ao) = *audio {
+                                        ao.stop();
+                                        log::info!("Peer: stopped");
+                                    }
+                                }
+                                Message::ResumeCommand { position_samples, .. } => {
+                                    let s = app_clone.state::<AppState>();
+                                    let audio = s.audio_output.lock().await;
+                                    if let Some(ref ao) = *audio {
+                                        ao.seek(position_samples);
+                                        ao.resume_at(std::time::Instant::now());
+                                        log::info!("Peer: resumed at sample {position_samples}");
+                                    }
+                                }
+                                Message::SeekCommand { position_samples, .. } => {
+                                    let s = app_clone.state::<AppState>();
+                                    let audio = s.audio_output.lock().await;
+                                    if let Some(ref ao) = *audio {
+                                        ao.seek(position_samples);
+                                        ao.resume_at(std::time::Instant::now());
+                                        log::info!("Peer: seeked to sample {position_samples}");
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -513,6 +635,7 @@ pub async fn leave_session(app: AppHandle) -> Result<(), String> {
     state.queue.lock().await.clear();
     state.track_data.lock().await.clear();
     state.song_requests.lock().await.clear();
+    *state.file_receiver.lock().await = FileReceiver::new();
     state.host_queue_state.lock().clear();
     *state.host_current_track.lock() = None;
     *state.host_tcp.lock() = None;
@@ -599,6 +722,14 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
             drop(audio);
 
             emit_playback_state(app, "playing", &file_name, 0, duration_ms);
+
+            // Broadcast ResumeCommand to peers.
+            let target_time_ns = now_ns() + 50_000_000; // 50ms safety margin
+            broadcast_to_peers(app, &Message::ResumeCommand {
+                position_samples: 0,
+                target_time_ns,
+            });
+
             return Ok(());
         }
         _ => {
@@ -663,8 +794,25 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
     ao.play_at(std::time::Instant::now());
     drop(audio);
 
+    // Update shared current track state for new peer joins.
+    *state.host_current_track.lock() = Some(CurrentTrack {
+        file_id: track_id,
+        file_name: file_name.clone(),
+        position_samples: 0,
+        sample_rate: 44100,
+        is_playing: true,
+    });
+
     // Emit state.
     emit_playback_state(app, "playing", &file_name, 0, duration_ms);
+
+    // Broadcast PlayCommand to peers.
+    let target_time_ns = now_ns() + 50_000_000; // 50ms safety margin
+    broadcast_to_peers(app, &Message::PlayCommand {
+        file_id: track_id,
+        position_samples: 0,
+        target_time_ns,
+    });
 
     // Start the position ticker.
     start_position_ticker(app, state, duration_ms).await;
@@ -702,6 +850,24 @@ pub async fn pause(app: AppHandle) -> Result<(), String> {
             };
 
             emit_playback_state(&app, "paused", &file_name, position_ms, duration_ms);
+
+            // Broadcast PauseCommand to peers.
+            let pos_samples = {
+                let audio = state.audio_output.lock().await;
+                audio.as_ref().map(|ao| ao.get_position()).unwrap_or(0)
+            };
+            broadcast_to_peers(&app, &Message::PauseCommand {
+                position_samples: pos_samples,
+            });
+
+            // Update shared current track state.
+            {
+                let mut ct = state.host_current_track.lock();
+                if let Some(ref mut track) = *ct {
+                    track.is_playing = false;
+                }
+            }
+
             log::info!("Paused playback");
             Ok(())
         }
@@ -726,6 +892,13 @@ pub async fn stop(app: AppHandle) -> Result<(), String> {
             drop(audio);
 
             emit_playback_state(&app, "stopped", "", 0, 0);
+
+            // Broadcast StopCommand to peers.
+            broadcast_to_peers(&app, &Message::StopCommand);
+
+            // Clear shared current track state.
+            *state.host_current_track.lock() = None;
+
             log::info!("Stopped playback");
             Ok(())
         }
@@ -763,6 +936,18 @@ pub async fn seek(app: AppHandle, position_ms: u64) -> Result<(), String> {
                     duration_ms,
                 },
             );
+
+            // Broadcast SeekCommand to peers.
+            let seek_samples = {
+                let audio = state.audio_output.lock().await;
+                audio.as_ref().map(|ao| ao.get_position()).unwrap_or(0)
+            };
+            let target_time_ns = now_ns() + 50_000_000;
+            broadcast_to_peers(&app, &Message::SeekCommand {
+                position_samples: seek_samples,
+                target_time_ns,
+            });
+
             log::info!("Seek to {position_ms} ms");
             Ok(())
         }
@@ -801,6 +986,7 @@ pub async fn skip(app: AppHandle) -> Result<(), String> {
             } else {
                 log::info!("Skip: no more tracks");
                 emit_playback_state(&app, "stopped", "", 0, 0);
+                broadcast_to_peers(&app, &Message::StopCommand);
             }
             Ok(())
         }
@@ -816,7 +1002,7 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
     let session = state.session.lock().await;
 
     match &*session {
-        Session::Host(_host) => {
+        Session::Host(host) => {
             use std::path::Path;
             let path = Path::new(&file_path);
             let file_name = path
@@ -854,7 +1040,24 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
             drop(queue);
 
             // Store the raw file bytes so we can decode & play later.
-            state.track_data.lock().await.insert(track_id, file_data);
+            state.track_data.lock().await.insert(track_id, file_data.clone());
+
+            // Transfer the file to all connected peers.
+            let peer_ids: Vec<u32> = host.peers.lock().keys().copied().collect();
+            if !peer_ids.is_empty() {
+                let tcp_host = host.tcp_host.clone();
+                let mut mgr = state.file_transfer_mgr.lock().await;
+                if let Err(e) = mgr.start_transfer_with_id(
+                    track_id,
+                    file_name.clone(),
+                    file_data,
+                    &peer_ids,
+                    &tcp_host,
+                ).await {
+                    log::warn!("Failed to transfer file to peers: {e}");
+                }
+            }
+
             drop(session);
 
             emit_queue_update(&app, &queue_items);
@@ -1050,6 +1253,7 @@ async fn auto_advance_to_next(app: AppHandle) {
     } else {
         log::info!("Track finished — no more tracks in queue");
         emit_playback_state(&app, "stopped", "", 0, 0);
+        broadcast_to_peers(&app, &Message::StopCommand);
     }
 }
 
