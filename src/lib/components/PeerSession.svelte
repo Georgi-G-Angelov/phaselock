@@ -76,8 +76,8 @@
 
     onMount(async () => {
         unlisteners.push(
-            await listen<QueueItem[]>(EVENTS.QUEUE_UPDATED, (e) => {
-                queueStore.set(e.payload);
+            await listen<{ queue: QueueItem[] }>(EVENTS.QUEUE_UPDATED, (e) => {
+                queueStore.set(e.payload.queue);
             }),
             await listen<PlaybackState>(EVENTS.PLAYBACK_STATE_CHANGED, (e) => {
                 playbackStore.set(e.payload);

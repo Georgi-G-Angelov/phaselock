@@ -1,6 +1,7 @@
 use crate::audio::playback::AudioOutput;
 use crate::network::mdns::{DiscoveredSession, MdnsBrowser};
-use crate::network::messages::{CurrentTrack, QueueItem};
+use crate::network::messages::{CurrentTrack, Message, QueueItem};
+use crate::network::tcp::TcpHost;
 use crate::queue::manager::QueueManager;
 use crate::session::Session;
 use crate::transfer::file_cache::FileCache;
@@ -8,6 +9,7 @@ use crate::transfer::song_request::SongRequestManager;
 use parking_lot::Mutex as ParkingMutex;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -139,6 +141,8 @@ pub struct AppState {
     pub audio_output: Mutex<Option<AudioOutput>>,
     /// Raw file bytes for each queued track (keyed by track UUID).
     pub track_data: Mutex<HashMap<Uuid, Vec<u8>>>,
+    /// Host's TCP handle — used to broadcast queue/playback updates to peers.
+    pub host_tcp: ParkingMutex<Option<Arc<TcpHost>>>,
 }
 
 impl AppState {
@@ -155,6 +159,7 @@ impl AppState {
             host_current_track: std::sync::Arc::new(ParkingMutex::new(None)),
             audio_output: Mutex::new(None),
             track_data: Mutex::new(HashMap::new()),
+            host_tcp: ParkingMutex::new(None),
         }
     }
 }
@@ -182,6 +187,15 @@ fn emit_queue_update(app: &AppHandle, queue: &[QueueItem]) {
             queue: queue.to_vec(),
         },
     );
+
+    // Broadcast queue update to all connected peers over TCP.
+    let tcp_host = state.host_tcp.lock().clone();
+    if let Some(tcp_host) = tcp_host {
+        let msg = Message::QueueUpdate { queue: queue.to_vec() };
+        tokio::spawn(async move {
+            tcp_host.broadcast(&msg).await;
+        });
+    }
 }
 
 fn discovered_to_payload(d: &DiscoveredSession) -> DiscoveredSessionPayload {
@@ -234,6 +248,9 @@ pub async fn create_session(
             // Wire the shared queue/track state into the host session.
             host_session.queue_state = state.host_queue_state.clone();
             host_session.current_track_state = state.host_current_track.clone();
+
+            // Store TCP handle so emit_queue_update can broadcast to peers.
+            *state.host_tcp.lock() = Some(host_session.tcp_host.clone());
 
             let info = SessionInfoPayload {
                 session_name: host_session.session_name.clone(),
@@ -393,7 +410,14 @@ pub async fn join_session(
                         crate::session::SessionEvent::JoinRejected { reason } => {
                             emit_error(&app_clone, &format!("Join rejected: {reason}"));
                         }
-                        crate::session::SessionEvent::MessageReceived { .. } => {}
+                        crate::session::SessionEvent::MessageReceived { message, .. } => {
+                            if let Message::QueueUpdate { queue } = message {
+                                let _ = app_clone.emit(
+                                    "queue:updated",
+                                    QueueUpdatedPayload { queue },
+                                );
+                            }
+                        }
                     }
                 }
             });
@@ -441,6 +465,7 @@ pub async fn leave_session(app: AppHandle) -> Result<(), String> {
     state.song_requests.lock().await.clear();
     state.host_queue_state.lock().clear();
     *state.host_current_track.lock() = None;
+    *state.host_tcp.lock() = None;
 
     session.shutdown().await;
 
