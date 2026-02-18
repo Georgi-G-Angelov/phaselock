@@ -532,8 +532,17 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
         }
         _ => {
             // Advance to the next ready track.
+            let has_tracks = !queue.is_empty();
             match queue.advance() {
                 Some(t) => t.clone(),
+                None if has_tracks => {
+                    // All tracks have been played — restart the queue.
+                    queue.restart();
+                    match queue.advance() {
+                        Some(t) => t.clone(),
+                        None => return Err("No tracks ready to play.".into()),
+                    }
+                }
                 None => return Err("No tracks ready to play.".into()),
             }
         }

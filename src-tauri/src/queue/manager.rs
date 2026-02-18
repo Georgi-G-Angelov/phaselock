@@ -223,6 +223,20 @@ impl QueueManager {
         }
     }
 
+    /// Restart the queue from the beginning.
+    ///
+    /// Marks every `Played` track as `Ready` and resets `current_index`
+    /// so the next call to `advance()` starts at index 0.
+    pub fn restart(&mut self) {
+        for item in &mut self.queue {
+            if item.status == QueueItemStatus::Played {
+                item.status = QueueItemStatus::Ready;
+            }
+        }
+        self.current_index = None;
+        log::info!("Queue: restarted from the beginning");
+    }
+
     /// Skip the current track and advance to the next one.
     ///
     /// Marks the current track as `Played` and calls `advance` logic
