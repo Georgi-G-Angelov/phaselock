@@ -17,7 +17,8 @@
         : 0;
     $: anyTransferring = $queueStore.some(q => q.status === 'Transferring');
     $: hasReadyTracks = $queueStore.some(q => q.status === 'Ready');
-    $: canPlay = hasTrack || hasReadyTracks;
+    $: hasPlayedTracks = $queueStore.some(q => q.status === 'Played');
+    $: canPlay = hasTrack || hasReadyTracks || hasPlayedTracks;
 
     function formatTime(ms: number): string {
         const totalSec = Math.floor(ms / 1000);
