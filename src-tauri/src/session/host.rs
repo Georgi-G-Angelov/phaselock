@@ -70,6 +70,22 @@ impl HostSession {
         skip_mdns: bool,
     ) -> Result<(Self, mpsc::Receiver<SessionEvent>), Box<dyn std::error::Error + Send + Sync>>
     {
+        Self::start_with_state(session_name, host_display_name, tcp_port, udp_port, skip_mdns, None, None).await
+    }
+
+    /// Like `start`, but accepts optional pre-existing shared state Arcs.
+    /// When provided, the event loop uses the same Arcs as the caller,
+    /// ensuring queue/track updates are visible to incoming peers.
+    pub async fn start_with_state(
+        session_name: String,
+        host_display_name: String,
+        tcp_port: u16,
+        udp_port: u16,
+        skip_mdns: bool,
+        shared_queue_state: Option<Arc<Mutex<Vec<QueueItem>>>>,
+        shared_current_track: Option<Arc<Mutex<Option<CurrentTrack>>>>,
+    ) -> Result<(Self, mpsc::Receiver<SessionEvent>), Box<dyn std::error::Error + Send + Sync>>
+    {
         let (session_event_tx, session_event_rx) = mpsc::channel::<SessionEvent>(64);
         let (tcp_event_tx, tcp_event_rx) = mpsc::channel::<TcpEvent>(128);
 
@@ -111,8 +127,8 @@ impl HostSession {
         // at 1, so they will match (we rely on this in the event loop).
         let next_peer_id = Arc::new(AtomicU32::new(1));
 
-        let queue_state: Arc<Mutex<Vec<QueueItem>>> = Arc::new(Mutex::new(Vec::new()));
-        let current_track_state: Arc<Mutex<Option<CurrentTrack>>> = Arc::new(Mutex::new(None));
+        let queue_state = shared_queue_state.unwrap_or_else(|| Arc::new(Mutex::new(Vec::new())));
+        let current_track_state = shared_current_track.unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
         let host = Self {
             session_name,

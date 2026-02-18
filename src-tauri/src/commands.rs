@@ -243,11 +243,16 @@ pub async fn create_session(
     let tcp_port = 17401u16;
     let udp_port = 17402u16;
 
-    match HostSession::start(session_name.clone(), display_name.clone(), tcp_port, udp_port, false).await {
-        Ok((mut host_session, mut event_rx)) => {
-            // Wire the shared queue/track state into the host session.
-            host_session.queue_state = state.host_queue_state.clone();
-            host_session.current_track_state = state.host_current_track.clone();
+    match HostSession::start_with_state(
+        session_name.clone(),
+        display_name.clone(),
+        tcp_port,
+        udp_port,
+        false,
+        Some(state.host_queue_state.clone()),
+        Some(state.host_current_track.clone()),
+    ).await {
+        Ok((host_session, mut event_rx)) => {
 
             // Store TCP handle so emit_queue_update can broadcast to peers.
             *state.host_tcp.lock() = Some(host_session.tcp_host.clone());
