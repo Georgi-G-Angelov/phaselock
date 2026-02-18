@@ -422,9 +422,34 @@ pub async fn leave_session(app: AppHandle) -> Result<(), String> {
         return Err("No active session to leave.".into());
     }
 
+    // Stop audio playback first.
+    stop_position_ticker(&state).await;
+    {
+        let audio = state.audio_output.lock().await;
+        if let Some(ref ao) = *audio {
+            ao.stop();
+        }
+    }
+
+    // Clear the queue and track data so the next session starts fresh.
+    state.queue.lock().await.clear();
+    state.track_data.lock().await.clear();
+    state.song_requests.lock().await.clear();
+    state.host_queue_state.lock().clear();
+    *state.host_current_track.lock() = None;
+
     session.shutdown().await;
+
+    // Notify the frontend.
+    let _ = app.emit("playback:state-changed", PlaybackStatePayload {
+        state: "stopped".into(),
+        file_name: String::new(),
+        position_ms: 0,
+        duration_ms: 0,
+    });
+    let _ = app.emit("queue:updated", QueueUpdatedPayload { queue: Vec::new() });
     let _ = app.emit("session:ended", ());
-    log::info!("Left session");
+    log::info!("Left session — audio stopped, queue cleared");
     Ok(())
 }
 
@@ -556,12 +581,6 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
     // Load and play.
     ao.load_track(decoded);
     ao.play_at(std::time::Instant::now());
-
-    // Register track-finished callback.
-    let app_finished = app.clone();
-    ao.on_track_finished(move || {
-        let _ = app_finished.emit("playback:track-finished", ());
-    });
     drop(audio);
 
     // Emit state.
@@ -960,6 +979,53 @@ pub async fn set_volume(app: AppHandle, volume: f32) -> Result<(), String> {
     Ok(())
 }
 
+// ── Auto-advance ────────────────────────────────────────────────────────────
+
+/// Called when a track finishes to automatically play the next queued track.
+async fn auto_advance_to_next(app: AppHandle) {
+    let state = app.state::<AppState>();
+
+    // Mark the current track as Played and advance the queue.
+    let mut queue = state.queue.lock().await;
+    let has_next = queue.skip().is_some();
+    let queue_items = queue.get_queue();
+    drop(queue);
+
+    emit_queue_update(&app, &queue_items);
+
+    if has_next {
+        log::info!("Track finished — auto-advancing to next track");
+        if let Err(e) = play_current_track(&app, &state).await {
+            log::error!("Auto-advance play failed: {e}");
+            emit_error(&app, &format!("Failed to play next track: {e}"));
+        }
+    } else {
+        log::info!("Track finished — no more tracks in queue");
+        let _ = app.emit(
+            "playback:state-changed",
+            PlaybackStatePayload {
+                state: "stopped".into(),
+                file_name: String::new(),
+                position_ms: 0,
+                duration_ms: 0,
+            },
+        );
+    }
+}
+
+/// Register the internal event listener that auto-advances to the next track
+/// when the current one finishes.  Call this once during app setup.
+pub fn setup_auto_advance_listener(app: &AppHandle) {
+    use tauri::Listener;
+    let app_clone = app.clone();
+    app.listen("internal:auto-advance", move |_| {
+        let app = app_clone.clone();
+        tauri::async_runtime::spawn(async move {
+            auto_advance_to_next(app).await;
+        });
+    });
+}
+
 // ── Playback Position Ticker ────────────────────────────────────────────────
 
 /// Start a background task that emits `playback:position` every 250 ms,
@@ -1005,13 +1071,15 @@ pub async fn start_position_ticker(
             });
 
             if is_stopped && position_ms > 0 {
-                // Track finished.
+                // Track finished — request auto-advance via internal event.
                 let _ = app_clone.emit("playback:track-finished", ());
+                let _ = app_clone.emit("internal:auto-advance", ());
                 break;
             }
 
             if position_ms > duration_ms {
                 let _ = app_clone.emit("playback:track-finished", ());
+                let _ = app_clone.emit("internal:auto-advance", ());
                 break;
             }
 

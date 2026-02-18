@@ -22,6 +22,12 @@ impl QueueManager {
         }
     }
 
+    /// Reset the queue to its initial empty state.
+    pub fn clear(&mut self) {
+        self.queue.clear();
+        self.current_index = None;
+    }
+
     // ── Mutations ───────────────────────────────────────────────────────
 
     /// Add a track to the end of the queue. Returns the generated `Uuid`.

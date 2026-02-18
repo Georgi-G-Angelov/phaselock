@@ -30,6 +30,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
+        .setup(|app| {
+            commands::setup_auto_advance_listener(app.handle());
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 use tauri::Manager;
@@ -46,8 +50,14 @@ pub fn run() {
                     if let Some(b) = browser.take() {
                         let _ = b.stop();
                     }
-                    // Stop position ticker.
+                    // Stop audio playback and position ticker.
                     commands::stop_position_ticker(&state).await;
+                    {
+                        let audio = state.audio_output.lock().await;
+                        if let Some(ref ao) = *audio {
+                            ao.stop();
+                        }
+                    }
                     log::info!("Graceful shutdown complete");
                 });
             }

@@ -77,6 +77,12 @@ impl SongRequestManager {
         }
     }
 
+    /// Reset to initial empty state.
+    pub fn clear(&mut self) {
+        self.pending_requests.clear();
+        self.active_uploads.clear();
+    }
+
     // ── Request intake ──────────────────────────────────────────────────
 
     /// Called when a `SongRequest` message arrives from a peer.
