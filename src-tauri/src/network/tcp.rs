@@ -284,7 +284,7 @@ impl Drop for TcpHost {
 
 /// Peer-side TCP client: connects to a host, reads/writes framed messages.
 pub struct TcpPeer {
-    writer: Option<OwnedWriteHalf>,
+    writer: Arc<tokio::sync::Mutex<Option<OwnedWriteHalf>>>,
     _reader_handle: tokio::task::JoinHandle<()>,
     _heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
@@ -357,16 +357,36 @@ impl TcpPeer {
                 .await;
         });
 
+        let writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
+
         let heartbeat_handle = if send_heartbeats {
-            // Heartbeat sending from peer side is handled externally
-            // by the session layer calling send(Heartbeat) on an interval.
-            None
+            let w = writer.clone();
+            let mut sd_rx = shutdown_tx.subscribe();
+            Some(tokio::spawn(async move {
+                let mut interval = time::interval(HEARTBEAT_INTERVAL);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let mut guard = w.lock().await;
+                            if let Some(ref mut wr) = *guard {
+                                if write_message(wr, &Message::Heartbeat).await.is_err() {
+                                    log::info!("Failed to send peer heartbeat");
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        _ = sd_rx.recv() => break,
+                    }
+                }
+            }))
         } else {
             None
         };
 
         Ok(Self {
-            writer: Some(writer),
+            writer,
             _reader_handle: reader_handle,
             _heartbeat_handle: heartbeat_handle,
             shutdown_tx,
@@ -375,7 +395,8 @@ impl TcpPeer {
 
     /// Send a message to the host.
     pub async fn send(&mut self, msg: &Message) -> Result<(), FrameError> {
-        if let Some(ref mut writer) = self.writer {
+        let mut guard = self.writer.lock().await;
+        if let Some(ref mut writer) = *guard {
             log::debug!("Sending to host: {msg:?}");
             write_message(writer, msg).await
         } else {
@@ -389,12 +410,13 @@ impl TcpPeer {
     /// Shut down the connection.
     pub fn shutdown(&mut self) {
         let _ = self.shutdown_tx.send(());
-        if let Some(mut w) = self.writer.take() {
-            // Use a blocking approach since Drop can't be async.
-            tokio::spawn(async move {
+        let writer_ref = self.writer.clone();
+        tokio::spawn(async move {
+            let mut guard = writer_ref.lock().await;
+            if let Some(mut w) = guard.take() {
                 let _ = w.shutdown().await;
-            });
-        }
+            }
+        });
     }
 }
 

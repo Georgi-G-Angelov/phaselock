@@ -54,7 +54,7 @@ impl PeerSession {
         let (tcp_event_tx, mut tcp_event_rx) = mpsc::channel::<TcpEvent>(128);
 
         // ── TCP connect ──
-        let mut tcp_peer = TcpPeer::connect(host_tcp_addr, tcp_event_tx, false).await?;
+        let mut tcp_peer = TcpPeer::connect(host_tcp_addr, tcp_event_tx, true).await?;
 
         // ── Send JoinRequest ──
         tcp_peer
