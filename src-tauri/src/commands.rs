@@ -332,8 +332,55 @@ pub async fn create_session(
                         crate::session::SessionEvent::JoinRejected { reason } => {
                             emit_error(&app_clone, &format!("Join rejected: {reason}"));
                         }
-                        crate::session::SessionEvent::MessageReceived { .. } => {
-                            // Handled by the session layer internally.
+                        crate::session::SessionEvent::MessageReceived { peer_id, message } => {
+                            match message {
+                                Message::FileCacheReport { file_ids } => {
+                                    // Peer told us what files it already has.
+                                    // Transfer any queued tracks the peer is missing.
+                                    let s = app_clone.state::<AppState>();
+                                    let queue = s.queue.lock().await;
+                                    let all_track_ids: Vec<Uuid> = queue.get_queue().iter().map(|q| q.id).collect();
+                                    drop(queue);
+
+                                    let cached_set: std::collections::HashSet<Uuid> = file_ids.into_iter().collect();
+                                    let missing: Vec<Uuid> = all_track_ids.into_iter()
+                                        .filter(|id| !cached_set.contains(id))
+                                        .collect();
+
+                                    if !missing.is_empty() {
+                                        log::info!("Peer {peer_id} is missing {} file(s) — transferring", missing.len());
+                                        let tcp_host = s.host_tcp.lock().clone();
+                                        let track_store = s.track_data.lock().await;
+                                        if let Some(tcp_host) = tcp_host {
+                                            let mut mgr = s.file_transfer_mgr.lock().await;
+                                            for file_id in missing {
+                                                if let Some(data) = track_store.get(&file_id) {
+                                                    let queue = s.queue.lock().await;
+                                                    let file_name = queue.get_queue().iter()
+                                                        .find(|q| q.id == file_id)
+                                                        .map(|q| q.file_name.clone())
+                                                        .unwrap_or_default();
+                                                    drop(queue);
+                                                    if let Err(e) = mgr.start_transfer_with_id(
+                                                        file_id,
+                                                        file_name.clone(),
+                                                        data.clone(),
+                                                        &[peer_id],
+                                                        &tcp_host,
+                                                    ).await {
+                                                        log::warn!("Failed to transfer \"{file_name}\" to peer {peer_id}: {e}");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        log::info!("Peer {peer_id} already has all files");
+                                    }
+                                }
+                                _ => {
+                                    // Other messages handled by session layer internally.
+                                }
+                            }
                         }
                     }
                 }
