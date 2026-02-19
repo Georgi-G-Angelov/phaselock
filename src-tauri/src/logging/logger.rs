@@ -117,6 +117,12 @@ impl Log for PhaseLockLogger {
             record.args()
         );
 
+        // On macOS, also print to stdout so logs are visible in the terminal.
+        #[cfg(target_os = "macos")]
+        {
+            println!("{line}");
+        }
+
         let is_error = record.level() == Level::Error;
 
         // Swap the buffer out under the lock, then flush outside the lock.
