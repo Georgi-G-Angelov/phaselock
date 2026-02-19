@@ -203,6 +203,16 @@ fn convert_sample_position(position_frames: u64, src_rate: u32, dst_rate: u32) -
     (position_frames as f64 * dst_rate as f64 / src_rate as f64).round() as u64
 }
 
+/// Compute how many frames of latency compensation to add on the peer side.
+///
+/// The peer receives a playback command ~latency ms after the host sent it,
+/// so by the time the peer starts playing the host is already `latency` ahead.
+/// We skip that many frames forward so both devices stay in sync.
+fn latency_compensation_frames(latency_ns: u64, sample_rate: u32) -> u64 {
+    // frames = latency_seconds * sample_rate
+    (latency_ns as f64 / 1_000_000_000.0 * sample_rate as f64).round() as u64
+}
+
 fn emit_queue_update(app: &AppHandle, queue: &[QueueItem]) {
     // Also update the shared host queue state so HostSession broadcasts it.
     let state = app.state::<AppState>();
@@ -738,6 +748,15 @@ pub async fn join_session(
                                     };
 
                                     if let Some(decoded) = decoded {
+                                        // Read latency BEFORE acquiring the audio lock
+                                        // (AudioOutput is !Send, can't hold across .await).
+                                        let latency_ns = {
+                                            let session = s.session.lock().await;
+                                            if let Session::Peer(ref peer) = *session {
+                                                peer.clock_sync.lock().current_latency_ns
+                                            } else { 0 }
+                                        };
+
                                         let mut audio = s.audio_output.lock().await;
                                         if audio.is_none() {
                                             match AudioOutput::new() {
@@ -755,13 +774,21 @@ pub async fn join_session(
                                         let vol = *s.volume.lock();
                                         ao.set_volume(vol);
                                         ao.load_track(decoded);
-                                        if position_samples > 0 {
-                                            let peer_sr = ao.device_sample_rate;
-                                            let adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
+
+                                        let peer_sr = ao.device_sample_rate;
+                                        let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
+
+                                        // Compensate for network latency: skip ahead by the
+                                        // estimated one-way latency so we start at the same
+                                        // point the host is at *now* (not when it sent the command).
+                                        let comp = latency_compensation_frames(latency_ns, peer_sr);
+                                        adjusted += comp;
+
+                                        if adjusted > 0 {
                                             ao.seek(adjusted);
                                         }
                                         ao.play_at(std::time::Instant::now());
-                                        log::info!("Peer: playing file {file_id}");
+                                        log::info!("Peer: playing file {file_id} at frame {adjusted} (latency comp +{comp} frames, {:.2} ms)", latency_ns as f64 / 1_000_000.0);
                                     }
                                 }
                                 Message::PauseCommand { position_samples, sample_rate: host_sr } => {
@@ -784,22 +811,42 @@ pub async fn join_session(
                                 }
                                 Message::ResumeCommand { position_samples, sample_rate: host_sr, .. } => {
                                     let s = app_clone.state::<AppState>();
+                                    let latency_ns = {
+                                        let session = s.session.lock().await;
+                                        if let Session::Peer(ref peer) = *session {
+                                            peer.clock_sync.lock().current_latency_ns
+                                        } else { 0 }
+                                    };
                                     let audio = s.audio_output.lock().await;
                                     if let Some(ref ao) = *audio {
-                                        let adjusted = convert_sample_position(position_samples, host_sr, ao.device_sample_rate);
+                                        let peer_sr = ao.device_sample_rate;
+                                        let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
+                                        let comp = latency_compensation_frames(latency_ns, peer_sr);
+                                        adjusted += comp;
+
                                         ao.seek(adjusted);
                                         ao.resume_at(std::time::Instant::now());
-                                        log::info!("Peer: resumed at sample {adjusted} (host sent {position_samples} @ {host_sr} Hz)");
+                                        log::info!("Peer: resumed at frame {adjusted} (latency comp +{comp}, {:.2} ms)", latency_ns as f64 / 1_000_000.0);
                                     }
                                 }
                                 Message::SeekCommand { position_samples, sample_rate: host_sr, .. } => {
                                     let s = app_clone.state::<AppState>();
+                                    let latency_ns = {
+                                        let session = s.session.lock().await;
+                                        if let Session::Peer(ref peer) = *session {
+                                            peer.clock_sync.lock().current_latency_ns
+                                        } else { 0 }
+                                    };
                                     let audio = s.audio_output.lock().await;
                                     if let Some(ref ao) = *audio {
-                                        let adjusted = convert_sample_position(position_samples, host_sr, ao.device_sample_rate);
+                                        let peer_sr = ao.device_sample_rate;
+                                        let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
+                                        let comp = latency_compensation_frames(latency_ns, peer_sr);
+                                        adjusted += comp;
+
                                         ao.seek(adjusted);
                                         ao.resume_at(std::time::Instant::now());
-                                        log::info!("Peer: seeked to sample {adjusted} (host sent {position_samples} @ {host_sr} Hz)");
+                                        log::info!("Peer: seeked to frame {adjusted} (latency comp +{comp}, {:.2} ms)", latency_ns as f64 / 1_000_000.0);
                                     }
                                 }
                                 _ => {}
