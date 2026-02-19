@@ -105,15 +105,14 @@ impl UdpHost {
             ClockMessage::ClockPing {
                 peer_id,
                 peer_send_time_ns,
+                peer_measured_latency_ns,
             } => {
                 let host_send_time_ns = now_ns();
 
-                // Track peer latency on host side.
+                // Store the peer's own RTT-based latency estimate.
                 tracker.lock().record_ping(
                     peer_id,
-                    peer_send_time_ns,
-                    host_recv_time_ns,
-                    host_send_time_ns,
+                    peer_measured_latency_ns,
                 );
 
                 let pong = ClockMessage::ClockPong {
@@ -179,6 +178,7 @@ impl UdpPeer {
 
         // Ping task: send ClockPing every PING_INTERVAL.
         let sock_ping = socket.clone();
+        let cs_ping = clock_sync.clone();
         let mut sd_rx_ping = shutdown_tx.subscribe();
         let ping_handle = tokio::spawn(async move {
             let mut interval = time::interval(PING_INTERVAL);
@@ -188,6 +188,7 @@ impl UdpPeer {
                         let ping = ClockMessage::ClockPing {
                             peer_id,
                             peer_send_time_ns: now_ns(),
+                            peer_measured_latency_ns: cs_ping.lock().current_latency_ns,
                         };
                         if let Ok(bytes) = bincode::serialize(&ping) {
                             if let Err(e) = sock_ping.send_to(&bytes, host_addr).await {
@@ -331,6 +332,7 @@ mod tests {
         let ping = ClockMessage::ClockPing {
             peer_id: 42,
             peer_send_time_ns: 123_456,
+            peer_measured_latency_ns: 0,
         };
         let bytes = bincode::serialize(&ping).unwrap();
         sock.send_to(&bytes, host_addr).await.unwrap();

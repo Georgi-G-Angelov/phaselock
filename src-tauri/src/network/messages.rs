@@ -91,7 +91,7 @@ pub struct CurrentTrack {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ClockMessage {
-    ClockPing { peer_id: u32, peer_send_time_ns: u64 },
+    ClockPing { peer_id: u32, peer_send_time_ns: u64, peer_measured_latency_ns: u64 },
     ClockPong {
         peer_id: u32,
         peer_send_time_ns: u64,
@@ -383,6 +383,7 @@ mod tests {
         roundtrip_clock(&ClockMessage::ClockPing {
             peer_id: 1,
             peer_send_time_ns: 123_456_789,
+            peer_measured_latency_ns: 5_000_000,
         });
     }
 

@@ -157,30 +157,20 @@ impl HostClockTracker {
         }
     }
 
-    /// Record a ping/pong round for a peer.
+    /// Record a ping from a peer, storing the peer's own measured latency.
     ///
-    /// `host_recv_ns` and `host_send_ns` are the host's monotonic timestamps
-    /// when it received the ping and sent the pong.
-    /// `peer_send_ns` is the peer's send timestamp from the `ClockPing`.
+    /// The peer piggybacks its RTT-based one-way latency estimate onto each
+    /// `ClockPing`, so we just store it directly. This is far more accurate
+    /// than anything the host can compute from a single leg.
     pub fn record_ping(
         &mut self,
         peer_id: u32,
-        _peer_send_ns: u64,
-        host_recv_ns: u64,
-        host_send_ns: u64,
+        peer_measured_latency_ns: u64,
     ) {
-        // On the host side we only know the host-side processing time.
-        // We approximate one-way latency as half the processing + propagation
-        // that we can observe. The full RTT is known only to the peer.
-        // We store host processing time / 2 as a minimum baseline; the peer
-        // supplies the full RTT-based estimate via its ClockSync.
-        // For command dispatch staggering we use the peer's reported latency,
-        // but we also keep a local approximation:
-        let processing_ns = host_send_ns.saturating_sub(host_recv_ns);
         self.peer_latencies.insert(
             peer_id,
             PeerLatency {
-                estimated_one_way_ns: processing_ns / 2,
+                estimated_one_way_ns: peer_measured_latency_ns,
                 last_updated: Instant::now(),
             },
         );
@@ -373,9 +363,9 @@ mod tests {
     fn test_host_clock_tracker() {
         let mut tracker = HostClockTracker::new();
 
-        tracker.record_ping(1, 100, 200, 210);
+        tracker.record_ping(1, 3_000_000); // peer reports 3ms one-way
         let lat = tracker.get_latency(1).unwrap();
-        assert_eq!(lat.estimated_one_way_ns, 5); // (210-200)/2
+        assert_eq!(lat.estimated_one_way_ns, 3_000_000);
 
         tracker.remove_peer(1);
         assert!(tracker.get_latency(1).is_none());

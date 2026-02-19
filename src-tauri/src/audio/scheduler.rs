@@ -524,8 +524,8 @@ mod tests {
             let mut t = tracker.lock();
             // Manually insert latencies for each peer.
             // peer_ids[0] = 10ms, peer_ids[1] = 30ms
-            t.record_ping(peer_ids[0], 0, 0, 20_000_000); // processing=20ms → latency=10ms
-            t.record_ping(peer_ids[1], 0, 0, 60_000_000); // processing=60ms → latency=30ms
+            t.record_ping(peer_ids[0], 10_000_000); // 10ms one-way
+            t.record_ping(peer_ids[1], 30_000_000); // 30ms one-way
         }
 
         let scheduler = PlaybackScheduler::new(tracker, host.clone(), None, 44100);
