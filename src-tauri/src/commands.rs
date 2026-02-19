@@ -329,6 +329,23 @@ pub async fn create_session(
             *session = Session::Host(host_session);
             drop(session);
 
+            // Eagerly initialise AudioOutput so play_current_track is instant.
+            {
+                let mut audio = state.audio_output.lock().await;
+                if audio.is_none() {
+                    match AudioOutput::new() {
+                        Ok(ao) => {
+                            *state.device_sample_rate.lock() = Some(ao.device_sample_rate);
+                            log::info!("[create_session] AudioOutput initialised eagerly — device rate = {} Hz", ao.device_sample_rate);
+                            *audio = Some(ao);
+                        }
+                        Err(e) => {
+                            log::warn!("[create_session] Failed to eagerly init AudioOutput: {e} — will init on first play");
+                        }
+                    }
+                }
+            }
+
             // Spawn a task to forward SessionEvents → Tauri events.
             let app_clone = app.clone();
             tokio::spawn(async move {
@@ -925,18 +942,31 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
         .clone();
     drop(track_store);
 
-    // Decode on a blocking thread to avoid blocking the async runtime.
-    let decoded = tokio::task::spawn_blocking(move || {
-        crate::audio::decoder::decode_mp3(&file_bytes)
-    })
-    .await
-    .map_err(|e| format!("Decode task failed: {e}"))?
-    .map_err(|e| format!("Failed to decode MP3: {e}"))?;
+    // Try pre-decoded cache first (instant path).
+    let pre_decoded = {
+        let mut dc = state.decoded_cache.lock().await;
+        dc.remove(&track_id)
+    };
+
+    let decoded = if let Some(d) = pre_decoded {
+        log::info!("[host] Using pre-decoded audio for {track_id}");
+        d
+    } else {
+        // Fall back to decoding on a blocking thread.
+        log::info!("[host] No pre-decoded audio for {track_id}, decoding {} bytes...", file_bytes.len());
+        tokio::task::spawn_blocking(move || {
+            crate::audio::decoder::decode_mp3(&file_bytes)
+        })
+        .await
+        .map_err(|e| format!("Decode task failed: {e}"))?
+        .map_err(|e| format!("Failed to decode MP3: {e}"))?
+    };
 
     // Lazily create AudioOutput if it doesn't exist yet.
     let mut audio = state.audio_output.lock().await;
     if audio.is_none() {
         let ao = AudioOutput::new().map_err(|e| format!("Failed to init audio: {e}"))?;
+        *state.device_sample_rate.lock() = Some(ao.device_sample_rate);
         *audio = Some(ao);
     }
 
@@ -946,16 +976,13 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
     let vol = *state.volume.lock();
     ao.set_volume(vol);
 
-    // Load and play.
+    // Load the track (should be instant if pre-resampled).
     ao.load_track(decoded);
-    ao.play_at(std::time::Instant::now());
-    drop(audio);
 
     // Update shared current track state for new peer joins.
-    let actual_sample_rate = {
-        let audio = state.audio_output.lock().await;
-        audio.as_ref().map(|ao| ao.playback_state().sample_rate.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(44100)
-    };
+    let actual_sample_rate = ao.playback_state().sample_rate.load(std::sync::atomic::Ordering::Acquire);
+    drop(audio);
+
     *state.host_current_track.lock() = Some(CurrentTrack {
         file_id: track_id,
         file_name: file_name.clone(),
@@ -964,16 +991,29 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
         is_playing: true,
     });
 
-    // Emit state.
-    emit_playback_state(app, "playing", &file_name, 0, duration_ms);
-
-    // Broadcast PlayCommand to peers.
-    let target_time_ns = now_ns() + 50_000_000; // 50ms safety margin
+    // Broadcast PlayCommand to peers FIRST, before we start local playback.
+    // This way the network message is already in flight while we wait.
+    let target_time_ns = now_ns() + 50_000_000;
     broadcast_to_peers(app, &Message::PlayCommand {
         file_id: track_id,
         position_samples: 0,
         target_time_ns,
     });
+
+    // Emit state.
+    emit_playback_state(app, "playing", &file_name, 0, duration_ms);
+
+    // Introduce an artificial delay so peers have time to receive and start
+    // playback.  On a typical LAN this is ~150-200 ms.  We schedule the
+    // local playback slightly into the future using play_at.
+    const HOST_SYNC_DELAY_MS: u64 = 150;
+    let play_instant = std::time::Instant::now() + std::time::Duration::from_millis(HOST_SYNC_DELAY_MS);
+    {
+        let audio = state.audio_output.lock().await;
+        if let Some(ref ao) = *audio {
+            ao.play_at(play_instant);
+        }
+    }
 
     // Start the position ticker.
     start_position_ticker(app, state, duration_ms).await;
@@ -1188,10 +1228,38 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
                 return Err("File is too large. Maximum size is 50 MB.".into());
             }
 
-            // Validate MP3 by trying to decode
-            let duration_secs = match crate::audio::decoder::decode_mp3(&file_data) {
-                Ok(decoded) => decoded.duration_secs,
+            // Validate MP3 by trying to decode — keep result for pre-cached playback.
+            let decoded = match crate::audio::decoder::decode_mp3(&file_data) {
+                Ok(d) => d,
                 Err(_e) => return Err("Invalid or corrupted MP3 file.".into()),
+            };
+            let duration_secs = decoded.duration_secs;
+
+            // Pre-resample to device rate if known, so play is instant.
+            let target_rate = *state.device_sample_rate.lock();
+            let cached_decoded = if let Some(dev_rate) = target_rate {
+                if decoded.sample_rate != dev_rate {
+                    log::info!("[add_song] Pre-resampling from {} Hz to {} Hz", decoded.sample_rate, dev_rate);
+                    let resampled = AudioOutput::resample(
+                        &decoded.samples,
+                        decoded.channels,
+                        decoded.sample_rate,
+                        dev_rate,
+                    );
+                    let new_frames = resampled.len() as u64 / decoded.channels as u64;
+                    let new_duration = new_frames as f64 / dev_rate as f64;
+                    crate::audio::decoder::DecodedAudio {
+                        samples: resampled,
+                        sample_rate: dev_rate,
+                        channels: decoded.channels,
+                        total_frames: new_frames,
+                        duration_secs: new_duration,
+                    }
+                } else {
+                    decoded
+                }
+            } else {
+                decoded
             };
 
             let mut queue = state.queue.lock().await;
@@ -1202,6 +1270,10 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
 
             // Store the raw file bytes so we can decode & play later.
             state.track_data.lock().await.insert(track_id, file_data.clone());
+
+            // Store pre-decoded (and pre-resampled) audio for instant playback.
+            state.decoded_cache.lock().await.insert(track_id, cached_decoded);
+            log::info!("[add_song] Pre-cached decoded audio for {track_id}");
 
             // Transfer the file to all connected peers.
             let peer_ids: Vec<u32> = host.peers.lock().keys().copied().collect();
