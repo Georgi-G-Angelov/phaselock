@@ -1018,7 +1018,7 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
     // Start the position ticker.
     start_position_ticker(app, state, duration_ms).await;
 
-    log::info!("Playing track '{}' ({} ms)", file_name, duration_ms);
+    log::info!("Playing track '{}' ({} ms) (delayed by {} ms)", file_name, duration_ms, HOST_SYNC_DELAY_MS);
     Ok(())
 }
 
