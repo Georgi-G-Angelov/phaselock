@@ -115,7 +115,7 @@ impl PlaybackState {
 pub struct AudioOutput {
     _stream: Stream,
     state: Arc<PlaybackState>,
-    device_sample_rate: u32,
+    pub device_sample_rate: u32,
     device_channels: u16,
 }
 
@@ -321,7 +321,7 @@ impl AudioOutput {
     }
 
     /// Resample interleaved audio from `src_rate` to `dst_rate` using linear interpolation.
-    fn resample(samples: &[f32], channels: u16, src_rate: u32, dst_rate: u32) -> Vec<f32> {
+    pub fn resample(samples: &[f32], channels: u16, src_rate: u32, dst_rate: u32) -> Vec<f32> {
         let ch = channels as usize;
         let src_frames = samples.len() / ch;
         let dst_frames = ((src_frames as f64) * (dst_rate as f64) / (src_rate as f64)).ceil() as usize;

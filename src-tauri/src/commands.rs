@@ -152,6 +152,8 @@ pub struct AppState {
     pub file_receiver: Mutex<FileReceiver>,
     /// Peer-side decoded audio cache — pre-decoded tracks ready for instant playback.
     pub decoded_cache: Mutex<HashMap<Uuid, DecodedAudio>>,
+    /// Cached device sample rate — set when AudioOutput is first created, used for pre-resampling.
+    pub device_sample_rate: ParkingMutex<Option<u32>>,
 }
 
 impl AppState {
@@ -172,6 +174,7 @@ impl AppState {
             file_transfer_mgr: Mutex::new(FileTransferManager::new()),
             file_receiver: Mutex::new(FileReceiver::new()),
             decoded_cache: Mutex::new(HashMap::new()),
+            device_sample_rate: ParkingMutex::new(None),
         }
     }
 }
@@ -507,6 +510,25 @@ pub async fn join_session(
             *session = Session::Peer(peer_session);
             drop(session);
 
+            // Eagerly initialise AudioOutput so we know the device sample rate
+            // before any PlayCommand arrives.  This lets the pre-decode task
+            // resample to the device rate in the background.
+            {
+                let mut audio = state.audio_output.lock().await;
+                if audio.is_none() {
+                    match AudioOutput::new() {
+                        Ok(ao) => {
+                            *state.device_sample_rate.lock() = Some(ao.device_sample_rate);
+                            log::info!("[join_session] AudioOutput initialised eagerly — device rate = {} Hz", ao.device_sample_rate);
+                            *audio = Some(ao);
+                        }
+                        Err(e) => {
+                            log::warn!("[join_session] Failed to eagerly init AudioOutput: {e} — will init on first PlayCommand");
+                        }
+                    }
+                }
+            }
+
             // Forward events.
             let app_clone = app.clone();
             tokio::spawn(async move {
@@ -569,23 +591,53 @@ pub async fn join_session(
                                                 cache.insert(*file_id, file_data.clone());
                                                 log::info!("Cached received file \"{file_name}\" ({file_id})");
 
-                                                // Pre-decode in background so PlayCommand is instant.
+                                                // Pre-decode (and pre-resample) in background so PlayCommand is instant.
                                                 let fid = *file_id;
                                                 let fname = file_name.clone();
                                                 let bytes = file_data.clone();
                                                 let app_for_decode = app_clone.clone();
+                                                let target_rate = *s.device_sample_rate.lock();
                                                 tokio::spawn(async move {
                                                     log::info!("[peer] Pre-decoding \"{fname}\" ({fid})...");
                                                     match tokio::task::spawn_blocking(move || {
-                                                        crate::audio::decoder::decode_mp3(&bytes)
+                                                        let decoded = crate::audio::decoder::decode_mp3(&bytes)?;
+                                                        // If we know the device sample rate and it differs,
+                                                        // resample now so load_track is instant later.
+                                                        if let Some(dev_rate) = target_rate {
+                                                            if decoded.sample_rate != dev_rate {
+                                                                log::info!(
+                                                                    "[peer] Pre-resampling \"{fname}\" from {} Hz to {} Hz",
+                                                                    decoded.sample_rate, dev_rate
+                                                                );
+                                                                let resampled = AudioOutput::resample(
+                                                                    &decoded.samples,
+                                                                    decoded.channels,
+                                                                    decoded.sample_rate,
+                                                                    dev_rate,
+                                                                );
+                                                                let new_frames = resampled.len() as u64 / decoded.channels as u64;
+                                                                let new_duration = new_frames as f64 / dev_rate as f64;
+                                                                return Ok(crate::audio::decoder::DecodedAudio {
+                                                                    samples: resampled,
+                                                                    sample_rate: dev_rate,
+                                                                    channels: decoded.channels,
+                                                                    total_frames: new_frames,
+                                                                    duration_secs: new_duration,
+                                                                });
+                                                            }
+                                                        }
+                                                        Ok::<_, crate::audio::decoder::DecodeError>(decoded)
                                                     }).await {
                                                         Ok(Ok(decoded)) => {
                                                             let st = app_for_decode.state::<AppState>();
+                                                            log::info!(
+                                                                "[peer] Pre-decoded \"{fid}\" — {} Hz, {} frames — ready for instant playback",
+                                                                decoded.sample_rate, decoded.total_frames
+                                                            );
                                                             st.decoded_cache.lock().await.insert(fid, decoded);
-                                                            log::info!("[peer] Pre-decoded \"{fname}\" ({fid}) — ready for instant playback");
                                                         }
-                                                        Ok(Err(e)) => log::warn!("[peer] Pre-decode of \"{fname}\" failed: {e}"),
-                                                        Err(e) => log::warn!("[peer] Pre-decode task of \"{fname}\" failed: {e}"),
+                                                        Ok(Err(e)) => log::warn!("[peer] Pre-decode of \"{fid}\" failed: {e}"),
+                                                        Err(e) => log::warn!("[peer] Pre-decode task of \"{fid}\" failed: {e}"),
                                                     }
                                                 });
                                             }
@@ -636,7 +688,10 @@ pub async fn join_session(
                                         let mut audio = s.audio_output.lock().await;
                                         if audio.is_none() {
                                             match AudioOutput::new() {
-                                                Ok(ao) => { *audio = Some(ao); }
+                                                Ok(ao) => {
+                                                    *s.device_sample_rate.lock() = Some(ao.device_sample_rate);
+                                                    *audio = Some(ao);
+                                                }
                                                 Err(e) => {
                                                     log::error!("Failed to init peer audio: {e}");
                                                     continue;
