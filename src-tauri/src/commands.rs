@@ -959,22 +959,24 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
             drop(queue);
 
             let audio = state.audio_output.lock().await;
-            if let Some(ref ao) = *audio {
+            let (current_pos, sr) = if let Some(ref ao) = *audio {
+                let pos = ao.get_position();
+                let rate = ao.device_sample_rate;
                 ao.resume_at(std::time::Instant::now());
-            }
+                (pos, rate)
+            } else {
+                (0, 44100)
+            };
             drop(audio);
 
             emit_playback_state(app, "playing", &file_name, 0, duration_ms);
 
-            // Broadcast ResumeCommand to peers.
+            // Broadcast ResumeCommand to peers with actual paused position.
             let target_time_ns = now_ns() + 50_000_000; // 50ms safety margin
             broadcast_to_peers(app, &Message::ResumeCommand {
-                position_samples: 0,
+                position_samples: current_pos,
                 target_time_ns,
-                sample_rate: {
-                    let audio = state.audio_output.lock().await;
-                    audio.as_ref().map(|ao| ao.playback_state().sample_rate.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(44100)
-                },
+                sample_rate: sr,
             });
 
             return Ok(());
