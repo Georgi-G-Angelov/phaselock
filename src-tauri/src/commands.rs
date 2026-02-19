@@ -154,6 +154,8 @@ pub struct AppState {
     pub decoded_cache: Mutex<HashMap<Uuid, DecodedAudio>>,
     /// Cached device sample rate — set when AudioOutput is first created, used for pre-resampling.
     pub device_sample_rate: ParkingMutex<Option<u32>>,
+    /// Handle to the latency-logging ticker task (aborted on session leave).
+    pub latency_ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -175,6 +177,7 @@ impl AppState {
             file_receiver: Mutex::new(FileReceiver::new()),
             decoded_cache: Mutex::new(HashMap::new()),
             device_sample_rate: ParkingMutex::new(None),
+            latency_ticker: Mutex::new(None),
         }
     }
 }
@@ -419,6 +422,30 @@ pub async fn create_session(
                     }
                 }
             });
+
+            // Start the latency-logging ticker.
+            {
+                let app_for_latency = app.clone();
+                let handle = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                    loop {
+                        interval.tick().await;
+                        let s = app_for_latency.state::<AppState>();
+                        let session = s.session.lock().await;
+                        if let Session::Host(ref host) = *session {
+                            if let Some(ref udp) = host.udp_host {
+                                let latencies = udp.tracker.lock().get_all_latencies();
+                                if !latencies.is_empty() {
+                                    for (peer_id, lat_ns) in &latencies {
+                                        log::info!("[latency] peer {peer_id}: {:.2} ms one-way", *lat_ns as f64 / 1_000_000.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                *state.latency_ticker.lock().await = Some(handle);
+            }
 
             log::info!("Created session \"{session_name}\"");
             Ok(info)
@@ -768,6 +795,31 @@ pub async fn join_session(
                 }
             });
 
+            // Start the latency-logging ticker.
+            {
+                let app_for_latency = app.clone();
+                let handle = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                    loop {
+                        interval.tick().await;
+                        let s = app_for_latency.state::<AppState>();
+                        let session = s.session.lock().await;
+                        if let Session::Peer(ref peer) = *session {
+                            let cs = peer.clock_sync.lock();
+                            if cs.measurement_count() > 0 {
+                                log::info!(
+                                    "[latency] host: {:.2} ms one-way, offset: {:.2} ms ({} measurements)",
+                                    cs.current_latency_ns as f64 / 1_000_000.0,
+                                    cs.current_offset_ns as f64 / 1_000_000.0,
+                                    cs.measurement_count(),
+                                );
+                            }
+                        }
+                    }
+                });
+                *state.latency_ticker.lock().await = Some(handle);
+            }
+
             log::info!("Joined session at {address}");
             Ok(info)
         }
@@ -796,7 +848,10 @@ pub async fn leave_session(app: AppHandle) -> Result<(), String> {
         return Err("No active session to leave.".into());
     }
 
-    // Stop audio playback first.
+    // Stop latency ticker and audio playback.
+    if let Some(h) = state.latency_ticker.lock().await.take() {
+        h.abort();
+    }
     stop_position_ticker(&state).await;
     {
         let audio = state.audio_output.lock().await;
