@@ -1080,7 +1080,7 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
     // Introduce an artificial delay so peers have time to receive and start
     // playback.  On a typical LAN this is ~150-200 ms.  We schedule the
     // local playback slightly into the future using play_at.
-    const HOST_SYNC_DELAY_MS: u64 = 150;
+    const HOST_SYNC_DELAY_MS: u64 = 0;
     let play_instant = std::time::Instant::now() + std::time::Duration::from_millis(HOST_SYNC_DELAY_MS);
     {
         let audio = state.audio_output.lock().await;
