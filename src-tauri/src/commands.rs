@@ -249,7 +249,7 @@ fn broadcast_to_peers(app: &AppHandle, msg: &Message) {
     let state = app.state::<AppState>();
     let tcp_host = state.host_tcp.lock().clone();
     if let Some(tcp_host) = tcp_host {
-        log::info!("[broadcast_to_peers] Sending {:?}", std::mem::discriminant(msg));
+        log::debug!("[broadcast_to_peers] Sending {:?}", std::mem::discriminant(msg));
         let msg = msg.clone();
         tokio::spawn(async move {
             tcp_host.broadcast(&msg).await;
