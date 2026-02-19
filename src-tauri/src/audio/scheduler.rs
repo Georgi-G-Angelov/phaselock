@@ -171,6 +171,7 @@ pub struct PlaybackScheduler {
     pub host_clock_tracker: Arc<Mutex<HostClockTracker>>,
     pub tcp_host: Arc<TcpHost>,
     pub audio_output: Option<Arc<AudioOutput>>,
+    pub sample_rate: u32,
 }
 
 impl PlaybackScheduler {
@@ -179,11 +180,13 @@ impl PlaybackScheduler {
         host_clock_tracker: Arc<Mutex<HostClockTracker>>,
         tcp_host: Arc<TcpHost>,
         audio_output: Option<Arc<AudioOutput>>,
+        sample_rate: u32,
     ) -> Self {
         Self {
             host_clock_tracker,
             tcp_host,
             audio_output,
+            sample_rate,
         }
     }
 
@@ -200,6 +203,7 @@ impl PlaybackScheduler {
             file_id,
             position_samples,
             target_time_ns,
+            sample_rate: self.sample_rate,
         };
 
         self.dispatch_staggered(plans, msg).await;
@@ -233,6 +237,7 @@ impl PlaybackScheduler {
         let msg = Message::ResumeCommand {
             position_samples,
             target_time_ns,
+            sample_rate: self.sample_rate,
         };
 
         self.dispatch_staggered(plans, msg).await;
@@ -259,6 +264,7 @@ impl PlaybackScheduler {
         let msg = Message::SeekCommand {
             position_samples,
             target_time_ns,
+            sample_rate: self.sample_rate,
         };
 
         self.dispatch_staggered(plans, msg).await;
@@ -276,7 +282,7 @@ impl PlaybackScheduler {
 
     /// Pause playback (broadcast immediately, no staggering).
     pub async fn pause(&self, position_samples: u64) -> Result<(), SchedulerError> {
-        let msg = Message::PauseCommand { position_samples };
+        let msg = Message::PauseCommand { position_samples, sample_rate: self.sample_rate };
         self.tcp_host.broadcast(&msg).await;
 
         if let Some(ref audio) = self.audio_output {
@@ -522,7 +528,7 @@ mod tests {
             t.record_ping(peer_ids[1], 0, 0, 60_000_000); // processing=60ms → latency=30ms
         }
 
-        let scheduler = PlaybackScheduler::new(tracker, host.clone(), None);
+        let scheduler = PlaybackScheduler::new(tracker, host.clone(), None, 44100);
 
         // Build a fake PeerState map.
         let mut peers = HashMap::new();
@@ -582,7 +588,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let tracker = Arc::new(Mutex::new(HostClockTracker::new()));
-        let scheduler = PlaybackScheduler::new(tracker, host.clone(), None);
+        let scheduler = PlaybackScheduler::new(tracker, host.clone(), None, 44100);
 
         scheduler.pause(12345).await.unwrap();
 
@@ -591,8 +597,9 @@ mod tests {
         let msg = read_message(&mut stream1).await.unwrap();
 
         match msg {
-            Message::PauseCommand { position_samples } => {
+            Message::PauseCommand { position_samples, sample_rate } => {
                 assert_eq!(position_samples, 12345);
+                assert_eq!(sample_rate, 44100);
             }
             other => panic!("Expected PauseCommand, got {:?}", other),
         }
@@ -615,7 +622,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let tracker = Arc::new(Mutex::new(HostClockTracker::new()));
-        let scheduler = PlaybackScheduler::new(tracker, host.clone(), None);
+        let scheduler = PlaybackScheduler::new(tracker, host.clone(), None, 44100);
 
         scheduler.stop().await.unwrap();
 

@@ -194,6 +194,15 @@ fn emit_error(app: &AppHandle, msg: &str) {
     let _ = app.emit("error:general", ErrorPayload { message: msg.to_string() });
 }
 
+/// Convert a sample position from one sample rate to another.
+/// E.g. frame 44100 at 44100 Hz = 1 second = frame 48000 at 48000 Hz.
+fn convert_sample_position(position_frames: u64, src_rate: u32, dst_rate: u32) -> u64 {
+    if src_rate == dst_rate || src_rate == 0 {
+        return position_frames;
+    }
+    (position_frames as f64 * dst_rate as f64 / src_rate as f64).round() as u64
+}
+
 fn emit_queue_update(app: &AppHandle, queue: &[QueueItem]) {
     // Also update the shared host queue state so HostSession broadcasts it.
     let state = app.state::<AppState>();
@@ -694,8 +703,8 @@ pub async fn join_session(
                                         }
                                     }
                                 }
-                                Message::PlayCommand { file_id, position_samples, .. } => {
-                                    log::info!("[peer] Received PlayCommand: file_id={file_id} position_samples={position_samples}");
+                                Message::PlayCommand { file_id, position_samples, sample_rate: host_sr, .. } => {
+                                    log::info!("[peer] Received PlayCommand: file_id={file_id} position_samples={position_samples} host_sr={host_sr}");
                                     let s = app_clone.state::<AppState>();
 
                                     // Try pre-decoded cache first (instant playback).
@@ -747,19 +756,22 @@ pub async fn join_session(
                                         ao.set_volume(vol);
                                         ao.load_track(decoded);
                                         if position_samples > 0 {
-                                            ao.seek(position_samples);
+                                            let peer_sr = ao.device_sample_rate;
+                                            let adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
+                                            ao.seek(adjusted);
                                         }
                                         ao.play_at(std::time::Instant::now());
                                         log::info!("Peer: playing file {file_id}");
                                     }
                                 }
-                                Message::PauseCommand { position_samples } => {
+                                Message::PauseCommand { position_samples, sample_rate: host_sr } => {
                                     let s = app_clone.state::<AppState>();
                                     let audio = s.audio_output.lock().await;
                                     if let Some(ref ao) = *audio {
-                                        ao.seek(position_samples);
+                                        let adjusted = convert_sample_position(position_samples, host_sr, ao.device_sample_rate);
+                                        ao.seek(adjusted);
                                         ao.pause();
-                                        log::info!("Peer: paused at sample {position_samples}");
+                                        log::info!("Peer: paused at sample {adjusted} (host sent {position_samples} @ {host_sr} Hz)");
                                     }
                                 }
                                 Message::StopCommand => {
@@ -770,22 +782,24 @@ pub async fn join_session(
                                         log::info!("Peer: stopped");
                                     }
                                 }
-                                Message::ResumeCommand { position_samples, .. } => {
+                                Message::ResumeCommand { position_samples, sample_rate: host_sr, .. } => {
                                     let s = app_clone.state::<AppState>();
                                     let audio = s.audio_output.lock().await;
                                     if let Some(ref ao) = *audio {
-                                        ao.seek(position_samples);
+                                        let adjusted = convert_sample_position(position_samples, host_sr, ao.device_sample_rate);
+                                        ao.seek(adjusted);
                                         ao.resume_at(std::time::Instant::now());
-                                        log::info!("Peer: resumed at sample {position_samples}");
+                                        log::info!("Peer: resumed at sample {adjusted} (host sent {position_samples} @ {host_sr} Hz)");
                                     }
                                 }
-                                Message::SeekCommand { position_samples, .. } => {
+                                Message::SeekCommand { position_samples, sample_rate: host_sr, .. } => {
                                     let s = app_clone.state::<AppState>();
                                     let audio = s.audio_output.lock().await;
                                     if let Some(ref ao) = *audio {
-                                        ao.seek(position_samples);
+                                        let adjusted = convert_sample_position(position_samples, host_sr, ao.device_sample_rate);
+                                        ao.seek(adjusted);
                                         ao.resume_at(std::time::Instant::now());
-                                        log::info!("Peer: seeked to sample {position_samples}");
+                                        log::info!("Peer: seeked to sample {adjusted} (host sent {position_samples} @ {host_sr} Hz)");
                                     }
                                 }
                                 _ => {}
@@ -957,6 +971,10 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
             broadcast_to_peers(app, &Message::ResumeCommand {
                 position_samples: 0,
                 target_time_ns,
+                sample_rate: {
+                    let audio = state.audio_output.lock().await;
+                    audio.as_ref().map(|ao| ao.playback_state().sample_rate.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(44100)
+                },
             });
 
             return Ok(());
@@ -1053,6 +1071,7 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
         file_id: track_id,
         position_samples: 0,
         target_time_ns,
+        sample_rate: actual_sample_rate,
     });
 
     // Emit state.
@@ -1114,6 +1133,10 @@ pub async fn pause(app: AppHandle) -> Result<(), String> {
             };
             broadcast_to_peers(&app, &Message::PauseCommand {
                 position_samples: pos_samples,
+                sample_rate: {
+                    let audio = state.audio_output.lock().await;
+                    audio.as_ref().map(|ao| ao.playback_state().sample_rate.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(44100)
+                },
             });
 
             // Update shared current track state.
@@ -1198,10 +1221,15 @@ pub async fn seek(app: AppHandle, position_ms: u64) -> Result<(), String> {
                 let audio = state.audio_output.lock().await;
                 audio.as_ref().map(|ao| ao.get_position()).unwrap_or(0)
             };
+            let host_sr = {
+                let audio = state.audio_output.lock().await;
+                audio.as_ref().map(|ao| ao.playback_state().sample_rate.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(44100)
+            };
             let target_time_ns = now_ns() + 50_000_000;
             broadcast_to_peers(&app, &Message::SeekCommand {
                 position_samples: seek_samples,
                 target_time_ns,
+                sample_rate: host_sr,
             });
 
             log::info!("Seek to {position_ms} ms");

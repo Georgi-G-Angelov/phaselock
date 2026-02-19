@@ -27,11 +27,11 @@ pub enum Message {
     SongUploadComplete { request_id: Uuid, sha256: [u8; 32] },
 
     // Playback control
-    PlayCommand { file_id: Uuid, position_samples: u64, target_time_ns: u64 },
-    PauseCommand { position_samples: u64 },
-    ResumeCommand { position_samples: u64, target_time_ns: u64 },
+    PlayCommand { file_id: Uuid, position_samples: u64, target_time_ns: u64, sample_rate: u32 },
+    PauseCommand { position_samples: u64, sample_rate: u32 },
+    ResumeCommand { position_samples: u64, target_time_ns: u64, sample_rate: u32 },
     StopCommand,
-    SeekCommand { position_samples: u64, target_time_ns: u64 },
+    SeekCommand { position_samples: u64, target_time_ns: u64, sample_rate: u32 },
 
     // Queue sync
     QueueUpdate { queue: Vec<QueueItem> },
@@ -317,6 +317,7 @@ mod tests {
             file_id: Uuid::new_v4(),
             position_samples: 44_100,
             target_time_ns: 1_000_000_000,
+            sample_rate: 44100,
         });
     }
 
@@ -324,6 +325,7 @@ mod tests {
     fn test_pause_command() {
         roundtrip_message(&Message::PauseCommand {
             position_samples: 88_200,
+            sample_rate: 44100,
         });
     }
 
@@ -332,6 +334,7 @@ mod tests {
         roundtrip_message(&Message::ResumeCommand {
             position_samples: 88_200,
             target_time_ns: 2_000_000_000,
+            sample_rate: 44100,
         });
     }
 
@@ -345,6 +348,7 @@ mod tests {
         roundtrip_message(&Message::SeekCommand {
             position_samples: 0,
             target_time_ns: 500_000_000,
+            sample_rate: 48000,
         });
     }
 
@@ -436,6 +440,7 @@ mod tests {
             file_id: Uuid::new_v4(),
             position_samples: 0,
             target_time_ns: u64::MAX,
+            sample_rate: 44100,
         })
         .await;
     }
@@ -487,6 +492,7 @@ mod tests {
             file_id: Uuid::nil(),
             position_samples: u64::MAX,
             target_time_ns: u64::MAX,
+            sample_rate: u32::MAX,
         });
     }
 
