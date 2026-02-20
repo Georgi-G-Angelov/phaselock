@@ -1234,42 +1234,50 @@ pub async fn join_session(
                                     let file_path = s.pending_request_paths.lock().remove(&file_name);
 
                                     if let Some(path) = file_path {
-                                        // Read the file.
-                                        match tokio::fs::read(&path).await {
-                                            Ok(file_data) => {
-                                                let sha256 = crate::transfer::file_transfer::compute_sha256(&file_data);
+                                        // Spawn upload as a background task so we don't block the
+                                        // event loop (which needs to process PlayCommand etc.).
+                                        let app_bg = app_clone.clone();
+                                        tokio::spawn(async move {
+                                            match tokio::fs::read(&path).await {
+                                                Ok(file_data) => {
+                                                    let sha256 = crate::transfer::file_transfer::compute_sha256(&file_data);
 
-                                                // Upload in chunks.
-                                                let chunk_size = crate::transfer::song_request::UPLOAD_CHUNK_SIZE;
-                                                let mut offset: u64 = 0;
-                                                for chunk in file_data.chunks(chunk_size) {
-                                                    let msg = Message::SongUploadChunk {
-                                                        request_id,
-                                                        offset,
-                                                        data: chunk.to_vec(),
-                                                    };
+                                                    // Upload in chunks.
+                                                    let chunk_size = crate::transfer::song_request::UPLOAD_CHUNK_SIZE;
+                                                    let mut offset: u64 = 0;
+                                                    let s = app_bg.state::<AppState>();
+                                                    for chunk in file_data.chunks(chunk_size) {
+                                                        let msg = Message::SongUploadChunk {
+                                                            request_id,
+                                                            offset,
+                                                            data: chunk.to_vec(),
+                                                        };
+                                                        let mut session = s.session.lock().await;
+                                                        if let Session::Peer(ref mut peer) = *session {
+                                                            if let Err(e) = peer.send(&msg).await {
+                                                                log::error!("[peer] Failed to send upload chunk: {e}");
+                                                                return;
+                                                            }
+                                                        }
+                                                        drop(session);
+                                                        offset += chunk.len() as u64;
+                                                        // Yield briefly to let other tasks (playback, heartbeats) run.
+                                                        tokio::task::yield_now().await;
+                                                    }
+
+                                                    // Send completion with hash.
+                                                    let msg = Message::SongUploadComplete { request_id, sha256 };
                                                     let mut session = s.session.lock().await;
                                                     if let Session::Peer(ref mut peer) = *session {
-                                                        if let Err(e) = peer.send(&msg).await {
-                                                            log::error!("[peer] Failed to send upload chunk: {e}");
-                                                            break;
-                                                        }
+                                                        let _ = peer.send(&msg).await;
                                                     }
-                                                    offset += chunk.len() as u64;
+                                                    log::info!("[peer] Upload complete for request {request_id} ({} bytes)", file_data.len());
                                                 }
-
-                                                // Send completion with hash.
-                                                let msg = Message::SongUploadComplete { request_id, sha256 };
-                                                let mut session = s.session.lock().await;
-                                                if let Session::Peer(ref mut peer) = *session {
-                                                    let _ = peer.send(&msg).await;
+                                                Err(e) => {
+                                                    log::error!("[peer] Failed to read file \"{path}\": {e}");
                                                 }
-                                                log::info!("[peer] Upload complete for request {request_id} ({} bytes)", file_data.len());
                                             }
-                                            Err(e) => {
-                                                log::error!("[peer] Failed to read file \"{path}\": {e}");
-                                            }
-                                        }
+                                        });
                                     } else {
                                         log::warn!("[peer] No stored file path for accepted request \"{file_name}\"");
                                     }
