@@ -39,14 +39,17 @@
 
     async function addSong() {
         const selected = await open({
-            multiple: false,
+            multiple: true,
             filters: [{ name: 'Audio', extensions: ['mp3'] }],
         });
         if (selected) {
-            try {
-                await invoke('add_song', { filePath: selected });
-            } catch (e) {
-                console.error('Failed to add song:', e);
+            const paths = Array.isArray(selected) ? selected : [selected];
+            for (const filePath of paths) {
+                try {
+                    await invoke('add_song', { filePath });
+                } catch (e) {
+                    console.error(`Failed to add song "${filePath}":`, e);
+                }
             }
         }
     }
