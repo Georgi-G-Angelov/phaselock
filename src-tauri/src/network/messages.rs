@@ -36,8 +36,19 @@ pub enum Message {
     // Queue sync
     QueueUpdate { queue: Vec<QueueItem> },
 
-    // Playback state notification (host → peers, for UI sync)
-    PlaybackStateUpdate { state: String, file_name: String, position_ms: u64, duration_ms: u64 },
+    // Playback state notification (host → peers, for UI sync + peer catch-up)
+    PlaybackStateUpdate {
+        state: String,
+        file_name: String,
+        position_ms: u64,
+        duration_ms: u64,
+        /// Track UUID — peers use this to look up cached audio for catch-up playback.
+        file_id: Uuid,
+        /// Current position in sample frames at the host's sample rate.
+        position_samples: u64,
+        /// Host's device sample rate (Hz).
+        sample_rate: u32,
+    },
 
     // Reconnection
     /// Sent by a peer after joining to tell the host which files it already has cached.

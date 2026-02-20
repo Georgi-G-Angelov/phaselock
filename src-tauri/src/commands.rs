@@ -250,15 +250,22 @@ fn emit_playback_state(app: &AppHandle, pstate: &str, file_name: &str, position_
         },
     );
 
-    // Broadcast to peers over TCP.
+    // Broadcast to peers over TCP with full playback info for catch-up.
     let state = app.state::<AppState>();
     let tcp_host = state.host_tcp.lock().clone();
     if let Some(tcp_host) = tcp_host {
+        let ct = state.host_current_track.lock().clone();
+        let (file_id, position_samples, sample_rate) = ct
+            .map(|t| (t.file_id, t.position_samples, t.sample_rate))
+            .unwrap_or((Uuid::nil(), 0, 0));
         let msg = Message::PlaybackStateUpdate {
             state: pstate.to_string(),
             file_name: file_name.to_string(),
             position_ms,
             duration_ms,
+            file_id,
+            position_samples,
+            sample_rate,
         };
         tokio::spawn(async move {
             tcp_host.broadcast(&msg).await;
@@ -622,8 +629,111 @@ pub async fn join_session(
                                         QueueUpdatedPayload { queue },
                                     );
                                 }
-                                Message::PlaybackStateUpdate { state, file_name, position_ms, duration_ms } => {
-                                    log::info!("[peer] Received PlaybackStateUpdate: state={state} file={file_name} pos={position_ms} dur={duration_ms}");
+                                Message::PlaybackStateUpdate { state, file_name, position_ms, duration_ms, file_id, position_samples, sample_rate: host_sr } => {
+                                    log::info!("[peer] Received PlaybackStateUpdate: state={state} file={file_name} pos={position_ms} dur={duration_ms} file_id={file_id} pos_samples={position_samples} host_sr={host_sr}");
+
+                                    // ── Peer catch-up: if host is playing but we are not, start playback ──
+                                    if state == "playing" {
+                                        let received_at = std::time::Instant::now();
+                                        let s = app_clone.state::<AppState>();
+
+                                        // Check current peer playback state (need audio lock).
+                                        let peer_is_playing = {
+                                            let audio = s.audio_output.lock().await;
+                                            if let Some(ref ao) = *audio {
+                                                matches!(ao.get_state(), crate::audio::playback::PlaybackStateEnum::Playing)
+                                            } else {
+                                                false
+                                            }
+                                        };
+
+                                        if !peer_is_playing {
+                                            log::info!("[peer] Catch-up: host is playing but we are not — attempting to start playback for {file_id}");
+
+                                            // Try pre-decoded cache first, then raw file cache.
+                                            let pre_decoded = {
+                                                let mut dc = s.decoded_cache.lock().await;
+                                                dc.remove(&file_id)
+                                            };
+
+                                            let decoded = if let Some(d) = pre_decoded {
+                                                log::info!("[peer] Catch-up: using pre-decoded audio for {file_id}");
+                                                Some(d)
+                                            } else {
+                                                let file_data = {
+                                                    let cache = s.file_cache.lock().await;
+                                                    cache.get(&file_id).cloned()
+                                                };
+                                                if let Some(file_bytes) = file_data {
+                                                    log::info!("[peer] Catch-up: decoding {} bytes for {file_id}...", file_bytes.len());
+                                                    match tokio::task::spawn_blocking(move || {
+                                                        crate::audio::decoder::decode_mp3(&file_bytes)
+                                                    }).await {
+                                                        Ok(Ok(d)) => Some(d),
+                                                        Ok(Err(e)) => { log::error!("[peer] Catch-up: failed to decode MP3: {e}"); None }
+                                                        Err(e) => { log::error!("[peer] Catch-up: decode task failed: {e}"); None }
+                                                    }
+                                                } else {
+                                                    log::warn!("[peer] Catch-up: file {file_id} not in cache yet (still transferring?)");
+                                                    None
+                                                }
+                                            };
+
+                                            if let Some(decoded) = decoded {
+                                                // Read latency BEFORE acquiring audio lock (AudioOutput is !Send).
+                                                let latency_ns = {
+                                                    let session = s.session.lock().await;
+                                                    if let Session::Peer(ref peer) = *session {
+                                                        peer.clock_sync.lock().current_latency_ns
+                                                    } else { 0 }
+                                                };
+
+                                                let mut audio = s.audio_output.lock().await;
+                                                if audio.is_none() {
+                                                    match AudioOutput::new() {
+                                                        Ok(ao) => {
+                                                            *s.device_sample_rate.lock() = Some(ao.device_sample_rate);
+                                                            *audio = Some(ao);
+                                                        }
+                                                        Err(e) => {
+                                                            log::error!("[peer] Catch-up: failed to init audio: {e}");
+                                                            // Still emit UI event below
+                                                            let _ = app_clone.emit(
+                                                                "playback:state-changed",
+                                                                PlaybackStatePayload { state, file_name, position_ms, duration_ms },
+                                                            );
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                                let ao = audio.as_ref().unwrap();
+                                                let vol = *s.volume.lock();
+                                                ao.set_volume(vol);
+                                                ao.load_track(decoded);
+
+                                                let peer_sr = ao.device_sample_rate;
+                                                let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
+
+                                                // Compensate for network latency + local processing time.
+                                                let processing_ns = received_at.elapsed().as_nanos() as u64;
+                                                let total_delay_ns = latency_ns + processing_ns;
+                                                let comp = latency_compensation_frames(total_delay_ns, peer_sr);
+                                                adjusted += comp;
+
+                                                if adjusted > 0 {
+                                                    ao.seek(adjusted);
+                                                }
+                                                ao.play_at(std::time::Instant::now());
+                                                log::info!(
+                                                    "[peer] Catch-up: playing {file_id} at frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
+                                                    latency_ns as f64 / 1_000_000.0,
+                                                    processing_ns as f64 / 1_000_000.0,
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    // Always emit the UI event.
                                     let _ = app_clone.emit(
                                         "playback:state-changed",
                                         PlaybackStatePayload {
@@ -1659,6 +1769,8 @@ pub fn setup_auto_advance_listener(app: &AppHandle) {
 
 /// Start a background task that emits `playback:position` every 250 ms,
 /// reading the real position from AudioOutput.
+/// Every ~2 seconds it also broadcasts a `PlaybackStateUpdate` to peers
+/// so late-joining or behind peers can catch up.
 pub async fn start_position_ticker(
     app: &AppHandle,
     state: &AppState,
@@ -1676,22 +1788,24 @@ pub async fn start_position_ticker(
 
     let handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(250));
+        let mut tick_count: u64 = 0;
 
         loop {
             interval.tick().await;
+            tick_count += 1;
 
-            let position_ms = if let Some(ref ps) = playback_state {
+            let (position_ms, position_frames, sr) = if let Some(ref ps) = playback_state {
                 let pos_samples = ps.position.load(std::sync::atomic::Ordering::Acquire) as u64;
                 let channels = ps.channels.load(std::sync::atomic::Ordering::Acquire) as u64;
                 let sr = ps.sample_rate.load(std::sync::atomic::Ordering::Acquire) as u64;
                 if sr > 0 && channels > 0 {
                     let frames = pos_samples / channels;
-                    (frames * 1000) / sr
+                    ((frames * 1000) / sr, frames, sr as u32)
                 } else {
-                    0
+                    (0, 0, 0)
                 }
             } else {
-                0
+                (0, 0, 0)
             };
 
             // Check if the track ended (AudioOutput transitions to Stopped).
@@ -1719,6 +1833,26 @@ pub async fn start_position_ticker(
                     duration_ms,
                 },
             );
+
+            // Every 8 ticks (~2 seconds), broadcast full PlaybackStateUpdate
+            // so peers that missed the initial PlayCommand can catch up.
+            if tick_count % 8 == 0 {
+                let s = app_clone.state::<AppState>();
+                let ct = s.host_current_track.lock().clone();
+                let tcp_host = s.host_tcp.lock().clone();
+                if let (Some(tcp), Some(track)) = (tcp_host, ct) {
+                    let msg = Message::PlaybackStateUpdate {
+                        state: "playing".to_string(),
+                        file_name: track.file_name.clone(),
+                        position_ms,
+                        duration_ms,
+                        file_id: track.file_id,
+                        position_samples: position_frames,
+                        sample_rate: sr,
+                    };
+                    tcp.broadcast(&msg).await;
+                }
+            }
         }
     });
 
