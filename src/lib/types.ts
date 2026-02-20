@@ -71,6 +71,11 @@ export interface SyncLatency {
   latency_ms: number;
 }
 
+export interface ListenersUpdated {
+  host_name: string;
+  listeners: PeerInfo[];
+}
+
 export interface ErrorEvent {
   message: string;
 }
@@ -112,6 +117,7 @@ export const EVENTS = {
   // Sync
   SYNC_LATENCY_UPDATED: 'sync:latency-updated',
   SYNC_STATE: 'sync:state',
+  LISTENERS_UPDATED: 'session:listeners-updated',
 
   // Error
   ERROR_GENERAL: 'error:general',

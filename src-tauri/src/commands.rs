@@ -115,6 +115,18 @@ struct SyncStatePayload {
 }
 
 #[derive(Clone, Serialize)]
+struct ListenerInfo {
+    peer_id: u32,
+    display_name: String,
+}
+
+#[derive(Clone, Serialize)]
+struct ListenersUpdatedPayload {
+    host_name: String,
+    listeners: Vec<ListenerInfo>,
+}
+
+#[derive(Clone, Serialize)]
 pub struct SessionInfoPayload {
     pub session_name: String,
     pub host_name: String,
@@ -469,6 +481,12 @@ pub async fn create_session(
                                         log::info!("[latency] peer {peer_id}: {:.2} ms one-way", *lat_ns as f64 / 1_000_000.0);
                                     }
                                 }
+                                // Update the session info for UDP broadcast.
+                                let listeners: Vec<(u32, String)> = host.peers.lock()
+                                    .values()
+                                    .map(|p| (p.peer_id, p.display_name.clone()))
+                                    .collect();
+                                *udp.session_info.lock() = (host.host_display_name.clone(), listeners);
                             }
                         }
                     }
@@ -1061,6 +1079,20 @@ pub async fn join_session(
                                     cs.current_offset_ns as f64 / 1_000_000.0,
                                     cs.measurement_count(),
                                 );
+                            }
+                            drop(cs);
+
+                            // Emit session listeners update if available from UDP.
+                            if let Some(ref udp) = peer.udp_peer {
+                                if let Some((host_name, raw_listeners)) = udp.session_info.lock().clone() {
+                                    let listeners: Vec<ListenerInfo> = raw_listeners.into_iter()
+                                        .map(|(pid, name)| ListenerInfo { peer_id: pid, display_name: name })
+                                        .collect();
+                                    let _ = app_for_latency.emit(
+                                        "session:listeners-updated",
+                                        ListenersUpdatedPayload { host_name, listeners },
+                                    );
+                                }
                             }
                         }
                     }

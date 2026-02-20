@@ -1,6 +1,7 @@
 use crate::network::messages::ClockMessage;
 use crate::sync::clock::{ClockSync, HostClockTracker};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,6 +20,12 @@ const PING_INTERVAL: Duration = Duration::from_millis(200);
 /// Maximum datagram size for clock messages.
 const MAX_DGRAM_SIZE: usize = 256;
 
+/// How often the host broadcasts session info (listeners list) to all peers.
+const SESSION_BROADCAST_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Maximum datagram size for session update messages (names can be long).
+const MAX_SESSION_DGRAM_SIZE: usize = 2048;
+
 // ── Monotonic clock helper ──────────────────────────────────────────────────
 
 /// A reference instant used to convert `Instant` to nanosecond timestamps.
@@ -36,25 +43,38 @@ pub fn now_ns() -> u64 {
 
 // ── UdpHost ─────────────────────────────────────────────────────────────────
 
-/// Host-side UDP listener for clock synchronization.
+/// Host-side UDP listener for clock synchronization and session info broadcast.
 pub struct UdpHost {
     pub tracker: Arc<Mutex<HostClockTracker>>,
+    /// Known peer UDP addresses (peer_id → last-seen SocketAddr).
+    pub peer_addrs: Arc<Mutex<HashMap<u32, SocketAddr>>>,
+    /// Shared session info for periodic broadcast: (host_name, listeners list).
+    /// Updated externally by the session layer.
+    pub session_info: Arc<Mutex<(String, Vec<(u32, String)>)>>,
     shutdown_tx: broadcast::Sender<()>,
     _listener_handle: tokio::task::JoinHandle<()>,
+    _broadcast_handle: tokio::task::JoinHandle<()>,
 }
 
 impl UdpHost {
     /// Bind on `port` and start responding to `ClockPing` messages.
+    /// Also starts a periodic session-info broadcast every 2 seconds.
     pub async fn start(port: u16) -> Result<Self, std::io::Error> {
         let socket = Arc::new(UdpSocket::bind(("0.0.0.0", port)).await?);
         let local_addr = socket.local_addr()?;
         log::info!("UDP clock host listening on {local_addr}");
 
         let tracker = Arc::new(Mutex::new(HostClockTracker::new()));
+        let peer_addrs: Arc<Mutex<HashMap<u32, SocketAddr>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let session_info: Arc<Mutex<(String, Vec<(u32, String)>)>> =
+            Arc::new(Mutex::new((String::new(), Vec::new())));
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<()>(1);
 
+        // ── Listener task ──
         let sock = socket.clone();
         let trk = tracker.clone();
+        let addrs = peer_addrs.clone();
 
         let listener_handle = tokio::spawn(async move {
             let mut buf = [0u8; MAX_DGRAM_SIZE];
@@ -63,7 +83,7 @@ impl UdpHost {
                     result = sock.recv_from(&mut buf) => {
                         match result {
                             Ok((len, src_addr)) => {
-                                Self::handle_datagram(&sock, &trk, &buf[..len], src_addr).await;
+                                Self::handle_datagram(&sock, &trk, &addrs, &buf[..len], src_addr).await;
                             }
                             Err(e) => {
                                 log::error!("UDP recv error: {e}");
@@ -78,16 +98,55 @@ impl UdpHost {
             }
         });
 
+        // ── Session broadcast task ──
+        let sock_bc = socket.clone();
+        let addrs_bc = peer_addrs.clone();
+        let info_bc = session_info.clone();
+        let mut sd_rx_bc = shutdown_tx.subscribe();
+
+        let broadcast_handle = tokio::spawn(async move {
+            let mut interval = time::interval(SESSION_BROADCAST_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let (host_name, listeners) = info_bc.lock().clone();
+                        if host_name.is_empty() {
+                            continue; // not configured yet
+                        }
+                        let msg = ClockMessage::SessionUpdate { host_name, listeners };
+                        let bytes = match bincode::serialize(&msg) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                log::debug!("UDP: failed to serialize SessionUpdate: {e}");
+                                continue;
+                            }
+                        };
+                        let addrs_snapshot: Vec<SocketAddr> = addrs_bc.lock().values().copied().collect();
+                        for addr in addrs_snapshot {
+                            if let Err(e) = sock_bc.send_to(&bytes, addr).await {
+                                log::debug!("UDP: failed to send SessionUpdate to {addr}: {e}");
+                            }
+                        }
+                    }
+                    _ = sd_rx_bc.recv() => break,
+                }
+            }
+        });
+
         Ok(Self {
             tracker,
+            peer_addrs,
+            session_info,
             shutdown_tx,
             _listener_handle: listener_handle,
+            _broadcast_handle: broadcast_handle,
         })
     }
 
     async fn handle_datagram(
         socket: &UdpSocket,
         tracker: &Arc<Mutex<HostClockTracker>>,
+        peer_addrs: &Arc<Mutex<HashMap<u32, SocketAddr>>>,
         data: &[u8],
         src_addr: SocketAddr,
     ) {
@@ -108,6 +167,9 @@ impl UdpHost {
                 peer_measured_latency_ns,
             } => {
                 let host_send_time_ns = now_ns();
+
+                // Remember peer address for session broadcasts.
+                peer_addrs.lock().insert(peer_id, src_addr);
 
                 // Store the peer's own RTT-based latency estimate.
                 tracker.lock().record_ping(
@@ -137,6 +199,9 @@ impl UdpHost {
             ClockMessage::ClockPong { .. } => {
                 log::debug!("UDP host: ignoring unexpected ClockPong from {src_addr}");
             }
+            ClockMessage::SessionUpdate { .. } => {
+                // Host ignores its own message type.
+            }
         }
     }
 
@@ -157,6 +222,8 @@ impl Drop for UdpHost {
 /// Peer-side UDP client that pings the host and maintains clock sync state.
 pub struct UdpPeer {
     pub clock_sync: Arc<Mutex<ClockSync>>,
+    /// Latest session info received from the host: (host_name, listeners).
+    pub session_info: Arc<Mutex<Option<(String, Vec<(u32, String)>)>>>,
     shutdown_tx: broadcast::Sender<()>,
     _ping_handle: tokio::task::JoinHandle<()>,
     _recv_handle: tokio::task::JoinHandle<()>,
@@ -174,6 +241,8 @@ impl UdpPeer {
         log::info!("UDP clock peer bound on {local_addr}, targeting host {host_addr}");
 
         let clock_sync = Arc::new(Mutex::new(ClockSync::new()));
+        let session_info: Arc<Mutex<Option<(String, Vec<(u32, String)>)>>> =
+            Arc::new(Mutex::new(None));
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
         // Ping task: send ClockPing every PING_INTERVAL.
@@ -201,31 +270,38 @@ impl UdpPeer {
             }
         });
 
-        // Receive task: listen for ClockPong and update ClockSync.
+        // Receive task: listen for ClockPong / SessionUpdate.
         let sock_recv = socket.clone();
         let cs = clock_sync.clone();
+        let si = session_info.clone();
         let mut sd_rx_recv = shutdown_tx.subscribe();
         let recv_handle = tokio::spawn(async move {
-            let mut buf = [0u8; MAX_DGRAM_SIZE];
+            let mut buf = [0u8; MAX_SESSION_DGRAM_SIZE];
             loop {
                 tokio::select! {
                     result = sock_recv.recv_from(&mut buf) => {
                         match result {
                             Ok((len, _src)) => {
-                                let peer_recv_time_ns = now_ns();
-                                if let Ok(ClockMessage::ClockPong {
-                                    peer_send_time_ns,
-                                    host_recv_time_ns,
-                                    host_send_time_ns,
-                                    ..
-                                }) = bincode::deserialize(&buf[..len])
-                                {
-                                    cs.lock().record_pong(
+                                match bincode::deserialize::<ClockMessage>(&buf[..len]) {
+                                    Ok(ClockMessage::ClockPong {
                                         peer_send_time_ns,
                                         host_recv_time_ns,
                                         host_send_time_ns,
-                                        peer_recv_time_ns,
-                                    );
+                                        ..
+                                    }) => {
+                                        let peer_recv_time_ns = now_ns();
+                                        cs.lock().record_pong(
+                                            peer_send_time_ns,
+                                            host_recv_time_ns,
+                                            host_send_time_ns,
+                                            peer_recv_time_ns,
+                                        );
+                                    }
+                                    Ok(ClockMessage::SessionUpdate { host_name, listeners }) => {
+                                        *si.lock() = Some((host_name, listeners));
+                                    }
+                                    Ok(_) => {} // ignore pings
+                                    Err(_) => {} // ignore malformed
                                 }
                             }
                             Err(e) => {
@@ -240,6 +316,7 @@ impl UdpPeer {
 
         Ok(Self {
             clock_sync,
+            session_info,
             shutdown_tx,
             _ping_handle: ping_handle,
             _recv_handle: recv_handle,

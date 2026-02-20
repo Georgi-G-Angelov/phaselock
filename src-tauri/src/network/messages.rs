@@ -124,6 +124,11 @@ pub enum ClockMessage {
         host_recv_time_ns: u64,
         host_send_time_ns: u64,
     },
+    /// Periodic session info broadcast from host → all peers.
+    SessionUpdate {
+        host_name: String,
+        listeners: Vec<(u32, String)>,
+    },
 }
 
 // ── Message Framing ─────────────────────────────────────────────────────────

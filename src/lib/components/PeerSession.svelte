@@ -6,7 +6,7 @@
     import NowPlaying from './NowPlaying.svelte';
     import Queue from './Queue.svelte';
     import Toast from './Toast.svelte';
-    import { sessionStore, peersStore } from '../stores/session';
+    import { sessionStore, peersStore, listenersStore } from '../stores/session';
     import { playbackStore, volumeStore } from '../stores/playback';
     import { queueStore } from '../stores/queue';
     import {
@@ -17,6 +17,7 @@
         type SyncLatency,
         type SyncState,
         type ErrorEvent,
+        type ListenersUpdated,
     } from '../types';
 
     const dispatch = createEventDispatcher<{ disconnected: void }>();
@@ -69,6 +70,7 @@
         invoke('leave_session').catch(e => console.error('Failed to leave session:', e));
         sessionStore.set(null);
         peersStore.set([]);
+        listenersStore.set(null);
         queueStore.set([]);
         playbackStore.set({ state: 'stopped', file_name: '', position_ms: 0, duration_ms: 0 });
         dispatch('disconnected');
@@ -93,6 +95,7 @@
                 setTimeout(() => {
                     sessionStore.set(null);
                     peersStore.set([]);
+                    listenersStore.set(null);
                     queueStore.set([]);
                     playbackStore.set({ state: 'stopped', file_name: '', position_ms: 0, duration_ms: 0 });
                     dispatch('disconnected');
@@ -104,6 +107,7 @@
                 setTimeout(() => {
                     sessionStore.set(null);
                     peersStore.set([]);
+                    listenersStore.set(null);
                     queueStore.set([]);
                     playbackStore.set({ state: 'stopped', file_name: '', position_ms: 0, duration_ms: 0 });
                     dispatch('disconnected');
@@ -121,6 +125,9 @@
                 console.log('[PeerSession] SYNC_STATE:', e.payload);
                 syncing = e.payload.syncing;
                 syncMessage = e.payload.message || 'Syncing...';
+            }),
+            await listen<ListenersUpdated>(EVENTS.LISTENERS_UPDATED, (e) => {
+                listenersStore.set(e.payload);
             }),
         );
     });
@@ -163,7 +170,35 @@
     </header>
 
     <div class="session-body flex flex-1 overflow-y-auto">
-        <!-- Left panel: Now Playing + Volume -->
+        <!-- Left panel: Listeners -->
+        <aside class="listeners-sidebar flex-col p-4">
+            <div class="listeners-panel panel flex-col gap-3">
+                <h4>Listeners</h4>
+                {#if $listenersStore}
+                    <!-- Host entry -->
+                    <div class="listener-item flex items-center gap-2 p-2">
+                        <span class="listener-avatar host-avatar flex-center flex-shrink-0">
+                            {$listenersStore.host_name.charAt(0).toUpperCase()}
+                        </span>
+                        <span class="text-sm text-ellipsis flex-1">{$listenersStore.host_name}</span>
+                        <span class="text-xs badge-host">Host</span>
+                    </div>
+                    <!-- Peer entries -->
+                    {#each $listenersStore.listeners as listener (listener.peer_id)}
+                        <div class="listener-item flex items-center gap-2 p-2">
+                            <span class="listener-avatar flex-center flex-shrink-0">
+                                {listener.display_name.charAt(0).toUpperCase()}
+                            </span>
+                            <span class="text-sm text-ellipsis flex-1">{listener.display_name}</span>
+                        </div>
+                    {/each}
+                {:else}
+                    <p class="text-secondary text-sm">Waiting for session info…</p>
+                {/if}
+            </div>
+        </aside>
+
+        <!-- Center panel: Now Playing + Volume -->
         <div class="main-area flex-col flex-1 gap-4 p-4">
             <NowPlaying hostControls={false} />
 
@@ -216,6 +251,40 @@
         flex-shrink: 0;
         border-left: 1px solid var(--border-subtle);
         overflow-y: auto;
+    }
+
+    .listeners-sidebar {
+        width: 220px;
+        flex-shrink: 0;
+        border-right: 1px solid var(--border-subtle);
+        overflow-y: auto;
+    }
+
+    .listener-item {
+        border-radius: var(--radius-sm);
+    }
+
+    .listener-avatar {
+        width: 1.75rem;
+        height: 1.75rem;
+        border-radius: var(--radius-full);
+        background: var(--bg-elevated);
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: var(--accent-green);
+    }
+
+    .host-avatar {
+        color: var(--bg-base);
+        background: var(--accent-green);
+    }
+
+    .badge-host {
+        background: var(--accent-green);
+        color: var(--bg-base);
+        padding: 0.1rem 0.4rem;
+        border-radius: var(--radius-sm);
+        font-weight: 600;
     }
 
     .volume-control {
