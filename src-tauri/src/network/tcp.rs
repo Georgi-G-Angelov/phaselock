@@ -37,9 +37,20 @@ pub enum TcpEvent {
 
 /// A sender that serialises outgoing messages for one peer.
 /// The actual writing happens in a dedicated per-peer task.
+///
+/// Messages are split into two channels:
+/// - `priority_tx`: playback commands, heartbeats, queue updates — anything
+///   that must arrive without delay.
+/// - `data_tx`: file transfer chunks and bulk data — these can be large and
+///   numerous, so they must never block control messages.
+///
+/// The writer task always drains all pending priority messages before sending
+/// a single data message, ensuring playback commands are never stuck behind
+/// a multi-megabyte file transfer.
 #[derive(Clone)]
 struct PeerSender {
-    tx: mpsc::Sender<Message>,
+    priority_tx: mpsc::Sender<Message>,
+    data_tx: mpsc::Sender<Message>,
     pub display_name: String,
 }
 
@@ -93,14 +104,53 @@ impl TcpHost {
 
                 let (reader, writer) = stream.into_split();
 
-                // Spawn a per-peer writer task that serialises all outgoing messages.
-                let (write_tx, mut write_rx) = mpsc::channel::<Message>(128);
+                // Spawn a per-peer writer task with priority + data channels.
+                // Priority channel: playback commands, heartbeats, etc.
+                // Data channel: file chunks, bulk transfers.
+                let (priority_tx, mut priority_rx) = mpsc::channel::<Message>(64);
+                let (data_tx, mut data_rx) = mpsc::channel::<Message>(128);
                 tokio::spawn(async move {
                     let mut writer = writer;
-                    while let Some(msg) = write_rx.recv().await {
-                        if let Err(e) = write_message(&mut writer, &msg).await {
-                            log::info!("Peer {peer_id}: write error: {e}");
-                            break;
+                    loop {
+                        // Always drain ALL pending priority messages first.
+                        loop {
+                            match priority_rx.try_recv() {
+                                Ok(msg) => {
+                                    if let Err(e) = write_message(&mut writer, &msg).await {
+                                        log::info!("Peer {peer_id}: write error (priority): {e}");
+                                        return;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+
+                        // Now wait for the next message from either channel,
+                        // biased toward priority.
+                        tokio::select! {
+                            biased;
+                            msg = priority_rx.recv() => {
+                                match msg {
+                                    Some(msg) => {
+                                        if let Err(e) = write_message(&mut writer, &msg).await {
+                                            log::info!("Peer {peer_id}: write error (priority): {e}");
+                                            return;
+                                        }
+                                    }
+                                    None => break, // priority channel closed
+                                }
+                            }
+                            msg = data_rx.recv() => {
+                                match msg {
+                                    Some(msg) => {
+                                        if let Err(e) = write_message(&mut writer, &msg).await {
+                                            log::info!("Peer {peer_id}: write error (data): {e}");
+                                            return;
+                                        }
+                                    }
+                                    None => break, // data channel closed
+                                }
+                            }
                         }
                     }
                     log::debug!("Peer {peer_id}: writer task exiting");
@@ -111,7 +161,8 @@ impl TcpHost {
                     map.insert(
                         peer_id,
                         PeerSender {
-                            tx: write_tx,
+                            priority_tx,
+                            data_tx,
                             display_name: String::new(),
                         },
                     );
@@ -191,6 +242,7 @@ impl TcpHost {
     }
 
     /// Send a message to a specific peer. Returns false if the peer is gone.
+    /// Automatically routes through the priority or data channel based on message type.
     pub async fn send_to_peer(&self, peer_id: u32, msg: &Message) -> bool {
         let sender = {
             let map = self.senders.lock();
@@ -199,7 +251,8 @@ impl TcpHost {
 
         match sender {
             Some(s) => {
-                if s.tx.send(msg.clone()).await.is_ok() {
+                let tx = if msg.is_bulk_data() { &s.data_tx } else { &s.priority_tx };
+                if tx.send(msg.clone()).await.is_ok() {
                     log::debug!("Queued message for peer {peer_id}");
                     true
                 } else {
@@ -213,14 +266,17 @@ impl TcpHost {
     }
 
     /// Broadcast a message to all connected peers.
+    /// Automatically routes through the priority or data channel based on message type.
     pub async fn broadcast(&self, msg: &Message) {
         let senders: Vec<(u32, PeerSender)> = {
             let map = self.senders.lock();
             map.iter().map(|(&id, s)| (id, s.clone())).collect()
         };
         log::info!("[TcpHost::broadcast] Sending to {} peer(s): {:?}", senders.len(), senders.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+        let is_bulk = msg.is_bulk_data();
         for (pid, sender) in senders {
-            if sender.tx.send(msg.clone()).await.is_err() {
+            let tx = if is_bulk { &sender.data_tx } else { &sender.priority_tx };
+            if tx.send(msg.clone()).await.is_err() {
                 log::info!("Peer {pid} writer channel closed during broadcast");
                 self.senders.lock().remove(&pid);
             }

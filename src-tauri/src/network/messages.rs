@@ -44,6 +44,21 @@ pub enum Message {
     FileCacheReport { file_ids: Vec<Uuid> },
 }
 
+impl Message {
+    /// Returns `true` for bulk-data messages (file/upload chunks) that should
+    /// use the low-priority write channel so they never block time-critical
+    /// playback commands and heartbeats.
+    pub fn is_bulk_data(&self) -> bool {
+        matches!(
+            self,
+            Message::FileChunk { .. }
+                | Message::FileTransferStart { .. }
+                | Message::SongUploadChunk { .. }
+                | Message::SongUploadComplete { .. }
+        )
+    }
+}
+
 // ── Supporting Structs ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
