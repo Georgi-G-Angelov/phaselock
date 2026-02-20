@@ -1,4 +1,5 @@
 use crate::network::messages::{QueueItem, QueueItemStatus};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 // ── QueueManager ────────────────────────────────────────────────────────────
@@ -156,6 +157,32 @@ impl QueueManager {
     /// Get the current index (if any).
     pub fn current_index(&self) -> Option<usize> {
         self.current_index
+    }
+
+    /// Return the IDs of the current track and the next `count - 1` tracks.
+    ///
+    /// If nothing is playing yet, returns up to `count` IDs from the
+    /// beginning of the queue (they are next to be played).
+    pub fn upcoming_ids(&self, count: usize) -> HashSet<Uuid> {
+        let start = self.current_index.unwrap_or(0);
+        self.queue
+            .iter()
+            .skip(start)
+            .take(count)
+            .map(|item| item.id)
+            .collect()
+    }
+
+    /// Replace the entire queue with the given items.
+    ///
+    /// Infers `current_index` from the item with `Playing` status.
+    /// Used by peers to sync queue state from host broadcasts.
+    pub fn replace_all(&mut self, items: Vec<QueueItem>) {
+        let playing_idx = items
+            .iter()
+            .position(|q| q.status == QueueItemStatus::Playing);
+        self.queue = items;
+        self.current_index = playing_idx;
     }
 
     // ── Status transitions ──────────────────────────────────────────────
@@ -642,5 +669,128 @@ mod tests {
         qm.remove(ids[0]);
         assert!(qm.is_empty());
         assert!(qm.current().is_none());
+    }
+
+    // ── upcoming_ids ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_upcoming_ids_no_current_returns_first_n() {
+        let mut qm = QueueManager::new();
+        let ids = add_tracks(&mut qm, 6);
+
+        let upcoming = qm.upcoming_ids(5);
+        assert_eq!(upcoming.len(), 5);
+        for &id in &ids[..5] {
+            assert!(upcoming.contains(&id));
+        }
+        assert!(!upcoming.contains(&ids[5]));
+    }
+
+    #[test]
+    fn test_upcoming_ids_with_current() {
+        let mut qm = QueueManager::new();
+        let ids = add_tracks(&mut qm, 8);
+        for &id in &ids {
+            qm.mark_ready(id);
+        }
+
+        qm.advance(); // current = 0
+        qm.advance(); // current = 1
+        qm.advance(); // current = 2
+
+        // Window: ids[2..7]
+        let upcoming = qm.upcoming_ids(5);
+        assert_eq!(upcoming.len(), 5);
+        for &id in &ids[2..7] {
+            assert!(upcoming.contains(&id));
+        }
+        // ids[0], ids[1] (played) and ids[7] (outside window) excluded.
+        assert!(!upcoming.contains(&ids[0]));
+        assert!(!upcoming.contains(&ids[1]));
+        assert!(!upcoming.contains(&ids[7]));
+    }
+
+    #[test]
+    fn test_upcoming_ids_near_end_returns_remainder() {
+        let mut qm = QueueManager::new();
+        let ids = add_tracks(&mut qm, 3);
+        for &id in &ids {
+            qm.mark_ready(id);
+        }
+
+        qm.advance(); // current = 0
+        qm.advance(); // current = 1
+
+        // Only 2 tracks left (ids[1], ids[2]), asked for 5.
+        let upcoming = qm.upcoming_ids(5);
+        assert_eq!(upcoming.len(), 2);
+        assert!(upcoming.contains(&ids[1]));
+        assert!(upcoming.contains(&ids[2]));
+    }
+
+    #[test]
+    fn test_upcoming_ids_empty_queue() {
+        let qm = QueueManager::new();
+        let upcoming = qm.upcoming_ids(5);
+        assert!(upcoming.is_empty());
+    }
+
+    // ── replace_all ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_replace_all_sets_queue_and_current_index() {
+        let mut qm = QueueManager::new();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+
+        let items = vec![
+            QueueItem { id: id1, file_name: "a.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Played },
+            QueueItem { id: id2, file_name: "b.mp3".into(), duration_secs: 200.0, added_by: "host".into(), status: QueueItemStatus::Playing },
+            QueueItem { id: id3, file_name: "c.mp3".into(), duration_secs: 300.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+        ];
+
+        qm.replace_all(items);
+
+        assert_eq!(qm.len(), 3);
+        assert_eq!(qm.current_index(), Some(1)); // id2 is Playing
+        assert_eq!(qm.current().unwrap().id, id2);
+    }
+
+    #[test]
+    fn test_replace_all_no_playing_sets_none() {
+        let mut qm = QueueManager::new();
+        let items = vec![
+            QueueItem { id: Uuid::new_v4(), file_name: "a.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+            QueueItem { id: Uuid::new_v4(), file_name: "b.mp3".into(), duration_secs: 200.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+        ];
+
+        qm.replace_all(items);
+        assert_eq!(qm.current_index(), None);
+    }
+
+    #[test]
+    fn test_replace_all_upcoming_ids_integration() {
+        let mut qm = QueueManager::new();
+        let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+
+        let items = vec![
+            QueueItem { id: ids[0], file_name: "a.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Played },
+            QueueItem { id: ids[1], file_name: "b.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Playing },
+            QueueItem { id: ids[2], file_name: "c.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+            QueueItem { id: ids[3], file_name: "d.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+            QueueItem { id: ids[4], file_name: "e.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+            QueueItem { id: ids[5], file_name: "f.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+        ];
+
+        qm.replace_all(items);
+
+        // Window of 5 from current (index 1): ids[1..6]
+        let upcoming = qm.upcoming_ids(5);
+        assert_eq!(upcoming.len(), 5);
+        assert!(!upcoming.contains(&ids[0])); // Played, before window
+        for &id in &ids[1..6] {
+            assert!(upcoming.contains(&id));
+        }
     }
 }

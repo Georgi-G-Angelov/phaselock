@@ -306,6 +306,156 @@ fn broadcast_to_peers(app: &AppHandle, msg: &Message) {
     }
 }
 
+/// Maximum number of decoded tracks to keep in memory (playing + next N).
+const DECODED_CACHE_WINDOW: usize = 5;
+
+/// Check whether a track id falls within the current decoded-cache window.
+///
+/// Returns `true` when the track is among the currently playing track and
+/// the next `DECODED_CACHE_WINDOW - 1` tracks in the queue, meaning it is
+/// worth pre-decoding.
+async fn is_in_cache_window(state: &AppState, track_id: Uuid) -> bool {
+    let queue = state.queue.lock().await;
+    queue.upcoming_ids(DECODED_CACHE_WINDOW).contains(&track_id)
+}
+
+/// Evict decoded audio entries that fall outside the playback window.
+///
+/// Keeps only the currently playing track and the next `DECODED_CACHE_WINDOW - 1`
+/// tracks in the queue. Must be called after any decoded_cache insertion or
+/// queue mutation (advance, reorder, remove).
+async fn evict_decoded_cache(state: &AppState) {
+    let keep_ids = {
+        let queue = state.queue.lock().await;
+        queue.upcoming_ids(DECODED_CACHE_WINDOW)
+    };
+
+    let mut dc = state.decoded_cache.lock().await;
+    let before = dc.len();
+    dc.retain(|id, _| keep_ids.contains(id));
+    let evicted = before - dc.len();
+    if evicted > 0 {
+        log::info!(
+            "[cache] Evicted {evicted} decoded track(s) outside playback window, keeping {}",
+            dc.len()
+        );
+    }
+}
+
+/// Backfill the decoded cache for any tracks inside the playback window
+/// that are not yet decoded.
+///
+/// Spawns background decode (+ optional resample) tasks for each missing
+/// track. Called after the window shifts (play, skip, advance).
+async fn backfill_decoded_cache(app: &AppHandle, state: &AppState) {
+    // Determine which IDs are in the window but not yet in the cache.
+    let (window_ids, is_host) = {
+        let queue = state.queue.lock().await;
+        let ids = queue.upcoming_ids(DECODED_CACHE_WINDOW);
+        let session = state.session.lock().await;
+        let host = matches!(&*session, Session::Host(_));
+        (ids, host)
+    };
+
+    let cached_ids: std::collections::HashSet<Uuid> = {
+        let dc = state.decoded_cache.lock().await;
+        dc.keys().copied().collect()
+    };
+
+    let missing: Vec<Uuid> = window_ids
+        .into_iter()
+        .filter(|id| !cached_ids.contains(id))
+        .collect();
+
+    if missing.is_empty() {
+        return;
+    }
+
+    log::info!(
+        "[cache] Backfilling {} track(s) into decoded cache",
+        missing.len()
+    );
+
+    let target_rate = *state.device_sample_rate.lock();
+
+    for file_id in missing {
+        // Get the raw bytes — host keeps them in track_data, peer in file_cache.
+        let raw_bytes: Option<Vec<u8>> = if is_host {
+            let store = state.track_data.lock().await;
+            store.get(&file_id).cloned()
+        } else {
+            let cache = state.file_cache.lock().await;
+            cache.get(&file_id).cloned()
+        };
+
+        let Some(bytes) = raw_bytes else {
+            log::debug!(
+                "[cache] Cannot backfill {file_id}: raw bytes not available yet"
+            );
+            continue;
+        };
+
+        let app_clone = app.clone();
+        tokio::spawn(async move {
+            log::info!("[cache] Backfill: decoding {file_id}...");
+            match tokio::task::spawn_blocking(move || {
+                let decoded = crate::audio::decoder::decode_mp3(&bytes)?;
+                if let Some(dev_rate) = target_rate {
+                    if decoded.sample_rate != dev_rate {
+                        log::info!(
+                            "[cache] Backfill: resampling {file_id} from {} Hz to {} Hz",
+                            decoded.sample_rate,
+                            dev_rate
+                        );
+                        let resampled = AudioOutput::resample(
+                            &decoded.samples,
+                            decoded.channels,
+                            decoded.sample_rate,
+                            dev_rate,
+                        );
+                        let new_frames =
+                            resampled.len() as u64 / decoded.channels as u64;
+                        let new_duration = new_frames as f64 / dev_rate as f64;
+                        return Ok(crate::audio::decoder::DecodedAudio {
+                            samples: resampled,
+                            sample_rate: dev_rate,
+                            channels: decoded.channels,
+                            total_frames: new_frames,
+                            duration_secs: new_duration,
+                        });
+                    }
+                }
+                Ok::<_, crate::audio::decoder::DecodeError>(decoded)
+            })
+            .await
+            {
+                Ok(Ok(decoded)) => {
+                    let st = app_clone.state::<AppState>();
+                    // Re-check window: the queue may have changed while we decoded.
+                    if is_in_cache_window(&st, file_id).await {
+                        log::info!(
+                            "[cache] Backfill: cached {file_id} — {} Hz, {} frames",
+                            decoded.sample_rate,
+                            decoded.total_frames
+                        );
+                        st.decoded_cache.lock().await.insert(file_id, decoded);
+                    } else {
+                        log::info!(
+                            "[cache] Backfill: {file_id} left window during decode, discarding"
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    log::warn!("[cache] Backfill: decode of {file_id} failed: {e}")
+                }
+                Err(e) => {
+                    log::warn!("[cache] Backfill: decode task of {file_id} failed: {e}")
+                }
+            }
+        });
+    }
+}
+
 fn discovered_to_payload(d: &DiscoveredSession) -> DiscoveredSessionPayload {
     DiscoveredSessionPayload {
         session_name: d.session_name.clone(),
@@ -552,44 +702,8 @@ pub async fn create_session(
                                                 };
                                                 let duration_secs = decoded.duration_secs;
 
-                                                // Pre-resample if needed (on blocking thread).
-                                                let target_rate = *s.device_sample_rate.lock();
-                                                let cached_decoded = if let Some(dev_rate) = target_rate {
-                                                    if decoded.sample_rate != dev_rate {
-                                                        log::info!("[host] Pre-resampling uploaded track from {} Hz to {} Hz", decoded.sample_rate, dev_rate);
-                                                        match tokio::task::spawn_blocking(move || {
-                                                            let resampled = AudioOutput::resample(
-                                                                &decoded.samples,
-                                                                decoded.channels,
-                                                                decoded.sample_rate,
-                                                                dev_rate,
-                                                            );
-                                                            let new_frames = resampled.len() as u64 / decoded.channels as u64;
-                                                            let new_duration = new_frames as f64 / dev_rate as f64;
-                                                            crate::audio::decoder::DecodedAudio {
-                                                                samples: resampled,
-                                                                sample_rate: dev_rate,
-                                                                channels: decoded.channels,
-                                                                total_frames: new_frames,
-                                                                duration_secs: new_duration,
-                                                            }
-                                                        }).await {
-                                                            Ok(d) => d,
-                                                            Err(e) => {
-                                                                log::error!("[host] Resample task failed: {e}");
-                                                                return;
-                                                            }
-                                                        }
-                                                    } else {
-                                                        decoded
-                                                    }
-                                                } else {
-                                                    decoded
-                                                };
-
-                                                // Add to queue using request_id as the track_id.
-                                                // This ensures host and peer agree on the file_id
-                                                // regardless of background-task completion order.
+                                                // Add to queue first (before cache decision) so
+                                                // we can check whether this track is in the window.
                                                 let track_id = request_id;
                                                 let mut queue = s.queue.lock().await;
                                                 queue.add_with_id(track_id, file_name.clone(), duration_secs, format!("peer {peer_id}"));
@@ -597,10 +711,54 @@ pub async fn create_session(
                                                 let queue_items = queue.get_queue();
                                                 drop(queue);
 
-                                                // Store raw file data and pre-decoded cache.
+                                                // Store raw file data.
                                                 s.track_data.lock().await.insert(track_id, file_data.clone());
-                                                s.decoded_cache.lock().await.insert(track_id, cached_decoded);
-                                                log::info!("[host] Pre-cached decoded audio for uploaded track {track_id}");
+
+                                                // Only pre-resample and cache if track is within the playback window.
+                                                if is_in_cache_window(&s, track_id).await {
+                                                    // Pre-resample if needed (on blocking thread).
+                                                    let target_rate = *s.device_sample_rate.lock();
+                                                    let cached_decoded = if let Some(dev_rate) = target_rate {
+                                                        if decoded.sample_rate != dev_rate {
+                                                            log::info!("[host] Pre-resampling uploaded track from {} Hz to {} Hz", decoded.sample_rate, dev_rate);
+                                                            match tokio::task::spawn_blocking(move || {
+                                                                let resampled = AudioOutput::resample(
+                                                                    &decoded.samples,
+                                                                    decoded.channels,
+                                                                    decoded.sample_rate,
+                                                                    dev_rate,
+                                                                );
+                                                                let new_frames = resampled.len() as u64 / decoded.channels as u64;
+                                                                let new_duration = new_frames as f64 / dev_rate as f64;
+                                                                crate::audio::decoder::DecodedAudio {
+                                                                    samples: resampled,
+                                                                    sample_rate: dev_rate,
+                                                                    channels: decoded.channels,
+                                                                    total_frames: new_frames,
+                                                                    duration_secs: new_duration,
+                                                                }
+                                                            }).await {
+                                                                Ok(d) => d,
+                                                                Err(e) => {
+                                                                    log::error!("[host] Resample task failed: {e}");
+                                                                    // Continue without caching — playback will decode on demand.
+                                                                    emit_queue_update(&app_for_upload, &queue_items);
+                                                                    return;
+                                                                }
+                                                            }
+                                                        } else {
+                                                            decoded
+                                                        }
+                                                    } else {
+                                                        decoded
+                                                    };
+
+                                                    s.decoded_cache.lock().await.insert(track_id, cached_decoded);
+                                                    log::info!("[host] Pre-cached decoded audio for uploaded track {track_id}");
+                                                    evict_decoded_cache(&s).await;
+                                                } else {
+                                                    log::info!("[host] Uploaded track {track_id} outside cache window, skipping pre-cache");
+                                                }
 
                                                 // Transfer the file to other peers (exclude the uploader — they already have it).
                                                 let tcp_host = s.host_tcp.lock().clone();
@@ -836,6 +994,17 @@ pub async fn join_session(
                             match message {
                                 Message::QueueUpdate { queue } => {
                                     log::info!("[peer] Received QueueUpdate: {} item(s)", queue.len());
+
+                                    // Sync local queue state so decoded-cache eviction
+                                    // knows which tracks are upcoming.
+                                    let s = app_clone.state::<AppState>();
+                                    {
+                                        let mut q = s.queue.lock().await;
+                                        q.replace_all(queue.clone());
+                                    }
+                                    evict_decoded_cache(&s).await;
+                                    backfill_decoded_cache(&app_clone, &s).await;
+
                                     let _ = app_clone.emit(
                                         "queue:updated",
                                         QueueUpdatedPayload { queue },
@@ -1068,55 +1237,61 @@ pub async fn join_session(
                                                 cache.insert(*file_id, file_data.clone());
                                                 log::info!("Cached received file \"{file_name}\" ({file_id})");
 
-                                                // Pre-decode (and pre-resample) in background so PlayCommand is instant.
+                                                // Pre-decode (and pre-resample) in background so PlayCommand is instant,
+                                                // but only if this track is within the cache window.
                                                 let fid = *file_id;
-                                                let fname = file_name.clone();
-                                                let bytes = file_data.clone();
-                                                let app_for_decode = app_clone.clone();
-                                                let target_rate = *s.device_sample_rate.lock();
-                                                tokio::spawn(async move {
-                                                    log::info!("[peer] Pre-decoding \"{fname}\" ({fid})...");
-                                                    match tokio::task::spawn_blocking(move || {
-                                                        let decoded = crate::audio::decoder::decode_mp3(&bytes)?;
-                                                        // If we know the device sample rate and it differs,
-                                                        // resample now so load_track is instant later.
-                                                        if let Some(dev_rate) = target_rate {
-                                                            if decoded.sample_rate != dev_rate {
-                                                                log::info!(
-                                                                    "[peer] Pre-resampling \"{fname}\" from {} Hz to {} Hz",
-                                                                    decoded.sample_rate, dev_rate
-                                                                );
-                                                                let resampled = AudioOutput::resample(
-                                                                    &decoded.samples,
-                                                                    decoded.channels,
-                                                                    decoded.sample_rate,
-                                                                    dev_rate,
-                                                                );
-                                                                let new_frames = resampled.len() as u64 / decoded.channels as u64;
-                                                                let new_duration = new_frames as f64 / dev_rate as f64;
-                                                                return Ok(crate::audio::decoder::DecodedAudio {
-                                                                    samples: resampled,
-                                                                    sample_rate: dev_rate,
-                                                                    channels: decoded.channels,
-                                                                    total_frames: new_frames,
-                                                                    duration_secs: new_duration,
-                                                                });
+                                                if is_in_cache_window(&s, fid).await {
+                                                    let fname = file_name.clone();
+                                                    let bytes = file_data.clone();
+                                                    let app_for_decode = app_clone.clone();
+                                                    let target_rate = *s.device_sample_rate.lock();
+                                                    tokio::spawn(async move {
+                                                        log::info!("[peer] Pre-decoding \"{fname}\" ({fid})...");
+                                                        match tokio::task::spawn_blocking(move || {
+                                                            let decoded = crate::audio::decoder::decode_mp3(&bytes)?;
+                                                            // If we know the device sample rate and it differs,
+                                                            // resample now so load_track is instant later.
+                                                            if let Some(dev_rate) = target_rate {
+                                                                if decoded.sample_rate != dev_rate {
+                                                                    log::info!(
+                                                                        "[peer] Pre-resampling \"{fname}\" from {} Hz to {} Hz",
+                                                                        decoded.sample_rate, dev_rate
+                                                                    );
+                                                                    let resampled = AudioOutput::resample(
+                                                                        &decoded.samples,
+                                                                        decoded.channels,
+                                                                        decoded.sample_rate,
+                                                                        dev_rate,
+                                                                    );
+                                                                    let new_frames = resampled.len() as u64 / decoded.channels as u64;
+                                                                    let new_duration = new_frames as f64 / dev_rate as f64;
+                                                                    return Ok(crate::audio::decoder::DecodedAudio {
+                                                                        samples: resampled,
+                                                                        sample_rate: dev_rate,
+                                                                        channels: decoded.channels,
+                                                                        total_frames: new_frames,
+                                                                        duration_secs: new_duration,
+                                                                    });
+                                                                }
                                                             }
+                                                            Ok::<_, crate::audio::decoder::DecodeError>(decoded)
+                                                        }).await {
+                                                            Ok(Ok(decoded)) => {
+                                                                let st = app_for_decode.state::<AppState>();
+                                                                log::info!(
+                                                                    "[peer] Pre-decoded \"{fid}\" — {} Hz, {} frames — ready for instant playback",
+                                                                    decoded.sample_rate, decoded.total_frames
+                                                                );
+                                                                st.decoded_cache.lock().await.insert(fid, decoded);
+                                                                evict_decoded_cache(&st).await;
+                                                            }
+                                                            Ok(Err(e)) => log::warn!("[peer] Pre-decode of \"{fid}\" failed: {e}"),
+                                                            Err(e) => log::warn!("[peer] Pre-decode task of \"{fid}\" failed: {e}"),
                                                         }
-                                                        Ok::<_, crate::audio::decoder::DecodeError>(decoded)
-                                                    }).await {
-                                                        Ok(Ok(decoded)) => {
-                                                            let st = app_for_decode.state::<AppState>();
-                                                            log::info!(
-                                                                "[peer] Pre-decoded \"{fid}\" — {} Hz, {} frames — ready for instant playback",
-                                                                decoded.sample_rate, decoded.total_frames
-                                                            );
-                                                            st.decoded_cache.lock().await.insert(fid, decoded);
-                                                        }
-                                                        Ok(Err(e)) => log::warn!("[peer] Pre-decode of \"{fid}\" failed: {e}"),
-                                                        Err(e) => log::warn!("[peer] Pre-decode task of \"{fid}\" failed: {e}"),
-                                                    }
-                                                });
+                                                    });
+                                                } else {
+                                                    log::info!("[peer] File \"{fid}\" outside cache window, skipping pre-decode");
+                                                }
                                             }
                                         }
                                         // Send FileReceived confirmation back to host.
@@ -1416,50 +1591,56 @@ pub async fn join_session(
                                                     }
                                                     log::info!("[peer] Cached own upload under {request_id} ({file_len} bytes)");
 
-                                                    // Pre-decode (and pre-resample) in background for instant playback.
+                                                    // Pre-decode (and pre-resample) in background for instant playback,
+                                                    // but only if this track is within the cache window.
                                                     let app_for_decode = app_bg.clone();
-                                                    let target_rate = *s.device_sample_rate.lock();
-                                                    tokio::spawn(async move {
-                                                        log::info!("[peer] Pre-decoding own upload {request_id}...");
-                                                        match tokio::task::spawn_blocking(move || {
-                                                            let decoded = crate::audio::decoder::decode_mp3(&file_data)?;
-                                                            if let Some(dev_rate) = target_rate {
-                                                                if decoded.sample_rate != dev_rate {
-                                                                    log::info!(
-                                                                        "[peer] Pre-resampling own upload from {} Hz to {} Hz",
-                                                                        decoded.sample_rate, dev_rate
-                                                                    );
-                                                                    let resampled = AudioOutput::resample(
-                                                                        &decoded.samples,
-                                                                        decoded.channels,
-                                                                        decoded.sample_rate,
-                                                                        dev_rate,
-                                                                    );
-                                                                    let new_frames = resampled.len() as u64 / decoded.channels as u64;
-                                                                    let new_duration = new_frames as f64 / dev_rate as f64;
-                                                                    return Ok(crate::audio::decoder::DecodedAudio {
-                                                                        samples: resampled,
-                                                                        sample_rate: dev_rate,
-                                                                        channels: decoded.channels,
-                                                                        total_frames: new_frames,
-                                                                        duration_secs: new_duration,
-                                                                    });
+                                                    if is_in_cache_window(&s, request_id).await {
+                                                        let target_rate = *s.device_sample_rate.lock();
+                                                        tokio::spawn(async move {
+                                                            log::info!("[peer] Pre-decoding own upload {request_id}...");
+                                                            match tokio::task::spawn_blocking(move || {
+                                                                let decoded = crate::audio::decoder::decode_mp3(&file_data)?;
+                                                                if let Some(dev_rate) = target_rate {
+                                                                    if decoded.sample_rate != dev_rate {
+                                                                        log::info!(
+                                                                            "[peer] Pre-resampling own upload from {} Hz to {} Hz",
+                                                                            decoded.sample_rate, dev_rate
+                                                                        );
+                                                                        let resampled = AudioOutput::resample(
+                                                                            &decoded.samples,
+                                                                            decoded.channels,
+                                                                            decoded.sample_rate,
+                                                                            dev_rate,
+                                                                        );
+                                                                        let new_frames = resampled.len() as u64 / decoded.channels as u64;
+                                                                        let new_duration = new_frames as f64 / dev_rate as f64;
+                                                                        return Ok(crate::audio::decoder::DecodedAudio {
+                                                                            samples: resampled,
+                                                                            sample_rate: dev_rate,
+                                                                            channels: decoded.channels,
+                                                                            total_frames: new_frames,
+                                                                            duration_secs: new_duration,
+                                                                        });
+                                                                    }
                                                                 }
+                                                                Ok::<_, crate::audio::decoder::DecodeError>(decoded)
+                                                            }).await {
+                                                                Ok(Ok(decoded)) => {
+                                                                    let st = app_for_decode.state::<AppState>();
+                                                                    log::info!(
+                                                                        "[peer] Pre-decoded own upload {request_id} — {} Hz, {} frames",
+                                                                        decoded.sample_rate, decoded.total_frames
+                                                                    );
+                                                                    st.decoded_cache.lock().await.insert(request_id, decoded);
+                                                                    evict_decoded_cache(&st).await;
+                                                                }
+                                                                Ok(Err(e)) => log::warn!("[peer] Pre-decode of own upload {request_id} failed: {e}"),
+                                                                Err(e) => log::warn!("[peer] Pre-decode task of own upload {request_id} failed: {e}"),
                                                             }
-                                                            Ok::<_, crate::audio::decoder::DecodeError>(decoded)
-                                                        }).await {
-                                                            Ok(Ok(decoded)) => {
-                                                                let st = app_for_decode.state::<AppState>();
-                                                                log::info!(
-                                                                    "[peer] Pre-decoded own upload {request_id} — {} Hz, {} frames",
-                                                                    decoded.sample_rate, decoded.total_frames
-                                                                );
-                                                                st.decoded_cache.lock().await.insert(request_id, decoded);
-                                                            }
-                                                            Ok(Err(e)) => log::warn!("[peer] Pre-decode of own upload {request_id} failed: {e}"),
-                                                            Err(e) => log::warn!("[peer] Pre-decode task of own upload {request_id} failed: {e}"),
-                                                        }
-                                                    });
+                                                        });
+                                                    } else {
+                                                        log::info!("[peer] Own upload {request_id} outside cache window, skipping pre-decode");
+                                                    }
 
                                                     log::info!("[peer] Upload complete for request {request_id} ({file_len} bytes)");
                                                 }
@@ -1787,6 +1968,11 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
     // Start the position ticker.
     start_position_ticker(app, state, duration_ms).await;
 
+    // Evict decoded entries outside the new playback window, then
+    // backfill any new window slots that are not yet decoded.
+    evict_decoded_cache(state).await;
+    backfill_decoded_cache(app, state).await;
+
     log::info!("Playing track '{}' ({} ms) (delayed by {} ms)", file_name, duration_ms, HOST_SYNC_DELAY_MS);
     Ok(())
 }
@@ -2017,38 +2203,7 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
             };
             let duration_secs = decoded.duration_secs;
 
-            // Pre-resample to device rate if known, so play is instant.
-            let target_rate = *state.device_sample_rate.lock();
-            let cached_decoded = if let Some(dev_rate) = target_rate {
-                if decoded.sample_rate != dev_rate {
-                    log::info!("[add_song] Pre-resampling from {} Hz to {} Hz", decoded.sample_rate, dev_rate);
-                    match tokio::task::spawn_blocking(move || {
-                        let resampled = AudioOutput::resample(
-                            &decoded.samples,
-                            decoded.channels,
-                            decoded.sample_rate,
-                            dev_rate,
-                        );
-                        let new_frames = resampled.len() as u64 / decoded.channels as u64;
-                        let new_duration = new_frames as f64 / dev_rate as f64;
-                        crate::audio::decoder::DecodedAudio {
-                            samples: resampled,
-                            sample_rate: dev_rate,
-                            channels: decoded.channels,
-                            total_frames: new_frames,
-                            duration_secs: new_duration,
-                        }
-                    }).await {
-                        Ok(d) => d,
-                        Err(e) => return Err(format!("Resample task failed: {e}")),
-                    }
-                } else {
-                    decoded
-                }
-            } else {
-                decoded
-            };
-
+            // Add to queue first so we can check if it's in the cache window.
             let mut queue = state.queue.lock().await;
             let track_id = queue.add(file_name.clone(), duration_secs, "host".into());
             queue.mark_ready(track_id);
@@ -2058,9 +2213,45 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
             // Store the raw file bytes so we can decode & play later.
             state.track_data.lock().await.insert(track_id, file_data.clone());
 
-            // Store pre-decoded (and pre-resampled) audio for instant playback.
-            state.decoded_cache.lock().await.insert(track_id, cached_decoded);
-            log::info!("[add_song] Pre-cached decoded audio for {track_id}");
+            // Only pre-resample and cache if the track is within the playback window.
+            if is_in_cache_window(&state, track_id).await {
+                let target_rate = *state.device_sample_rate.lock();
+                let cached_decoded = if let Some(dev_rate) = target_rate {
+                    if decoded.sample_rate != dev_rate {
+                        log::info!("[add_song] Pre-resampling from {} Hz to {} Hz", decoded.sample_rate, dev_rate);
+                        match tokio::task::spawn_blocking(move || {
+                            let resampled = AudioOutput::resample(
+                                &decoded.samples,
+                                decoded.channels,
+                                decoded.sample_rate,
+                                dev_rate,
+                            );
+                            let new_frames = resampled.len() as u64 / decoded.channels as u64;
+                            let new_duration = new_frames as f64 / dev_rate as f64;
+                            crate::audio::decoder::DecodedAudio {
+                                samples: resampled,
+                                sample_rate: dev_rate,
+                                channels: decoded.channels,
+                                total_frames: new_frames,
+                                duration_secs: new_duration,
+                            }
+                        }).await {
+                            Ok(d) => d,
+                            Err(e) => return Err(format!("Resample task failed: {e}")),
+                        }
+                    } else {
+                        decoded
+                    }
+                } else {
+                    decoded
+                };
+
+                state.decoded_cache.lock().await.insert(track_id, cached_decoded);
+                log::info!("[add_song] Pre-cached decoded audio for {track_id}");
+                evict_decoded_cache(&state).await;
+            } else {
+                log::info!("[add_song] Track {track_id} outside cache window, skipping pre-cache");
+            }
 
             // Transfer the file to all connected peers in background.
             let peer_ids: Vec<u32> = host.peers.lock().keys().copied().collect();
@@ -2113,6 +2304,10 @@ pub async fn remove_from_queue(app: AppHandle, track_id: String) -> Result<(), S
 
             emit_queue_update(&app, &queue_items);
 
+            // Evict decoded entries outside the new playback window.
+            evict_decoded_cache(&state).await;
+            backfill_decoded_cache(&app, &state).await;
+
             log::info!("Removed track {id} from queue");
             Ok(())
         }
@@ -2133,7 +2328,11 @@ pub async fn reorder_queue(app: AppHandle, from_index: usize, to_index: usize) -
             }
             let queue_items = queue.get_queue();
             drop(queue);
+            // Evict decoded entries outside the new playback window.
+            evict_decoded_cache(&state).await;
+            backfill_decoded_cache(&app, &state).await;
 
+            
             emit_queue_update(&app, &queue_items);
 
             log::info!("Reordered queue: {} → {}", from_index, to_index);
