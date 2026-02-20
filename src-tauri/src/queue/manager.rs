@@ -33,6 +33,12 @@ impl QueueManager {
     /// Add a track to the end of the queue. Returns the generated `Uuid`.
     pub fn add(&mut self, file_name: String, duration_secs: f64, added_by: String) -> Uuid {
         let id = Uuid::new_v4();
+        self.add_with_id(id, file_name, duration_secs, added_by);
+        id
+    }
+
+    /// Add a track with a pre-determined UUID (e.g. from a song-request id).
+    pub fn add_with_id(&mut self, id: Uuid, file_name: String, duration_secs: f64, added_by: String) {
         self.queue.push(QueueItem {
             id,
             file_name,
@@ -41,7 +47,6 @@ impl QueueManager {
             status: QueueItemStatus::Transferring,
         });
         log::info!("Queue: added track {} (total={})", id, self.queue.len());
-        id
     }
 
     /// Remove a track by id. Returns `true` if found and removed.

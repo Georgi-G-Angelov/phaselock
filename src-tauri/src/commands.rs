@@ -172,9 +172,6 @@ pub struct AppState {
     pub peer_current_file_id: ParkingMutex<Option<Uuid>>,
     /// Peer-side: maps file_name → file_path for pending song requests awaiting host accept.
     pub pending_request_paths: ParkingMutex<HashMap<String, String>>,
-    /// Peer-side: raw file data for uploads in-flight, keyed by request_id.
-    /// Stored so we can cache it locally once the host assigns a track_id.
-    pub pending_upload_data: Mutex<HashMap<Uuid, Vec<u8>>>,
 }
 
 impl AppState {
@@ -199,7 +196,6 @@ impl AppState {
             latency_ticker: Mutex::new(None),
             peer_current_file_id: ParkingMutex::new(None),
             pending_request_paths: ParkingMutex::new(HashMap::new()),
-            pending_upload_data: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -591,9 +587,12 @@ pub async fn create_session(
                                                     decoded
                                                 };
 
-                                                // Add to queue.
+                                                // Add to queue using request_id as the track_id.
+                                                // This ensures host and peer agree on the file_id
+                                                // regardless of background-task completion order.
+                                                let track_id = request_id;
                                                 let mut queue = s.queue.lock().await;
-                                                let track_id = queue.add(file_name.clone(), duration_secs, format!("peer {peer_id}"));
+                                                queue.add_with_id(track_id, file_name.clone(), duration_secs, format!("peer {peer_id}"));
                                                 queue.mark_ready(track_id);
                                                 let queue_items = queue.get_queue();
                                                 drop(queue);
@@ -606,11 +605,6 @@ pub async fn create_session(
                                                 // Transfer the file to other peers (exclude the uploader — they already have it).
                                                 let tcp_host = s.host_tcp.lock().clone();
                                                 if let Some(tcp_host) = tcp_host {
-                                                    // Tell the uploader the assigned track_id so they can cache it locally.
-                                                    let assign_msg = Message::SongUploadAssigned { file_id: track_id };
-                                                    tcp_host.send_to_peer(peer_id, &assign_msg).await;
-                                                    log::info!("[host] Sent SongUploadAssigned({track_id}) to peer {peer_id}");
-
                                                     let session = s.session.lock().await;
                                                     if let Session::Host(ref host) = *session {
                                                         let other_peer_ids: Vec<u32> = host.peers.lock()
@@ -1412,11 +1406,62 @@ pub async fn join_session(
                                                     }
                                                     drop(session);
 
-                                                    // Stash the file data so we can cache it once the host
-                                                    // tells us the assigned track_id (SongUploadAssigned).
-                                                    s.pending_upload_data.lock().await.insert(request_id, file_data.clone());
+                                                    // Cache the file locally under request_id (= track_id).
+                                                    // The host uses request_id as the file_id in the queue,
+                                                    // so both sides agree on the ID without coordination.
+                                                    let file_len = file_data.len();
+                                                    {
+                                                        let mut cache = s.file_cache.lock().await;
+                                                        cache.insert(request_id, file_data.clone());
+                                                    }
+                                                    log::info!("[peer] Cached own upload under {request_id} ({file_len} bytes)");
 
-                                                    log::info!("[peer] Upload complete for request {request_id} ({} bytes)", file_data.len());
+                                                    // Pre-decode (and pre-resample) in background for instant playback.
+                                                    let app_for_decode = app_bg.clone();
+                                                    let target_rate = *s.device_sample_rate.lock();
+                                                    tokio::spawn(async move {
+                                                        log::info!("[peer] Pre-decoding own upload {request_id}...");
+                                                        match tokio::task::spawn_blocking(move || {
+                                                            let decoded = crate::audio::decoder::decode_mp3(&file_data)?;
+                                                            if let Some(dev_rate) = target_rate {
+                                                                if decoded.sample_rate != dev_rate {
+                                                                    log::info!(
+                                                                        "[peer] Pre-resampling own upload from {} Hz to {} Hz",
+                                                                        decoded.sample_rate, dev_rate
+                                                                    );
+                                                                    let resampled = AudioOutput::resample(
+                                                                        &decoded.samples,
+                                                                        decoded.channels,
+                                                                        decoded.sample_rate,
+                                                                        dev_rate,
+                                                                    );
+                                                                    let new_frames = resampled.len() as u64 / decoded.channels as u64;
+                                                                    let new_duration = new_frames as f64 / dev_rate as f64;
+                                                                    return Ok(crate::audio::decoder::DecodedAudio {
+                                                                        samples: resampled,
+                                                                        sample_rate: dev_rate,
+                                                                        channels: decoded.channels,
+                                                                        total_frames: new_frames,
+                                                                        duration_secs: new_duration,
+                                                                    });
+                                                                }
+                                                            }
+                                                            Ok::<_, crate::audio::decoder::DecodeError>(decoded)
+                                                        }).await {
+                                                            Ok(Ok(decoded)) => {
+                                                                let st = app_for_decode.state::<AppState>();
+                                                                log::info!(
+                                                                    "[peer] Pre-decoded own upload {request_id} — {} Hz, {} frames",
+                                                                    decoded.sample_rate, decoded.total_frames
+                                                                );
+                                                                st.decoded_cache.lock().await.insert(request_id, decoded);
+                                                            }
+                                                            Ok(Err(e)) => log::warn!("[peer] Pre-decode of own upload {request_id} failed: {e}"),
+                                                            Err(e) => log::warn!("[peer] Pre-decode task of own upload {request_id} failed: {e}"),
+                                                        }
+                                                    });
+
+                                                    log::info!("[peer] Upload complete for request {request_id} ({file_len} bytes)");
                                                 }
                                                 Err(e) => {
                                                     log::error!("[peer] Failed to read file \"{path}\": {e}");
@@ -1431,87 +1476,6 @@ pub async fn join_session(
                                     log::info!("[peer] Song request {request_id} was rejected by host");
                                     // Clean up — we don't know the file_name from this message,
                                     // but it's fine to leave it; it'll be cleaned on session end.
-                                }
-                                Message::SongUploadAssigned { file_id } => {
-                                    // The host assigned a track_id to our uploaded file.
-                                    // Cache the raw file data locally so we don't receive
-                                    // it back from the host, and pre-decode for instant playback.
-                                    log::info!("[peer] Received SongUploadAssigned: file_id={file_id}");
-                                    let s = app_clone.state::<AppState>();
-
-                                    // Find the upload data — try all pending uploads since
-                                    // we may have multiple requests in flight.  The host
-                                    // sends SongUploadAssigned in the same order as it
-                                    // processes SongUploadComplete, so just pop the first one.
-                                    let upload_data = {
-                                        let mut pending = s.pending_upload_data.lock().await;
-                                        // Try to find the matching entry; if the map has only one
-                                        // entry, take it directly (common case).
-                                        if pending.len() == 1 {
-                                            let key = *pending.keys().next().unwrap();
-                                            pending.remove(&key)
-                                        } else {
-                                            // Multiple uploads — we don't know which request_id
-                                            // maps to this file_id, so pop the oldest (insertion order).
-                                            let key = pending.keys().next().copied();
-                                            key.and_then(|k| pending.remove(&k))
-                                        }
-                                    };
-
-                                    if let Some(file_data) = upload_data {
-                                        // Store in file cache under the assigned track_id.
-                                        let mut cache = s.file_cache.lock().await;
-                                        cache.insert(file_id, file_data.clone());
-                                        drop(cache);
-                                        log::info!("[peer] Cached own uploaded file under {file_id} ({} bytes)", file_data.len());
-
-                                        // Pre-decode (and pre-resample) in background for instant playback.
-                                        let app_for_decode = app_clone.clone();
-                                        let target_rate = *s.device_sample_rate.lock();
-                                        tokio::spawn(async move {
-                                            log::info!("[peer] Pre-decoding own upload {file_id}...");
-                                            match tokio::task::spawn_blocking(move || {
-                                                let decoded = crate::audio::decoder::decode_mp3(&file_data)?;
-                                                if let Some(dev_rate) = target_rate {
-                                                    if decoded.sample_rate != dev_rate {
-                                                        log::info!(
-                                                            "[peer] Pre-resampling own upload from {} Hz to {} Hz",
-                                                            decoded.sample_rate, dev_rate
-                                                        );
-                                                        let resampled = AudioOutput::resample(
-                                                            &decoded.samples,
-                                                            decoded.channels,
-                                                            decoded.sample_rate,
-                                                            dev_rate,
-                                                        );
-                                                        let new_frames = resampled.len() as u64 / decoded.channels as u64;
-                                                        let new_duration = new_frames as f64 / dev_rate as f64;
-                                                        return Ok(crate::audio::decoder::DecodedAudio {
-                                                            samples: resampled,
-                                                            sample_rate: dev_rate,
-                                                            channels: decoded.channels,
-                                                            total_frames: new_frames,
-                                                            duration_secs: new_duration,
-                                                        });
-                                                    }
-                                                }
-                                                Ok::<_, crate::audio::decoder::DecodeError>(decoded)
-                                            }).await {
-                                                Ok(Ok(decoded)) => {
-                                                    let st = app_for_decode.state::<AppState>();
-                                                    log::info!(
-                                                        "[peer] Pre-decoded own upload {file_id} — {} Hz, {} frames",
-                                                        decoded.sample_rate, decoded.total_frames
-                                                    );
-                                                    st.decoded_cache.lock().await.insert(file_id, decoded);
-                                                }
-                                                Ok(Err(e)) => log::warn!("[peer] Pre-decode of own upload {file_id} failed: {e}"),
-                                                Err(e) => log::warn!("[peer] Pre-decode task of own upload {file_id} failed: {e}"),
-                                            }
-                                        });
-                                    } else {
-                                        log::warn!("[peer] No pending upload data for SongUploadAssigned {file_id}");
-                                    }
                                 }
                                 _ => {}
                             }
