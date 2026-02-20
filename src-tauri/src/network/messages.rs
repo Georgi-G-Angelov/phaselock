@@ -25,6 +25,9 @@ pub enum Message {
     SongRequestRejected { request_id: Uuid },
     SongUploadChunk { request_id: Uuid, offset: u64, data: Vec<u8> },
     SongUploadComplete { request_id: Uuid, sha256: [u8; 32] },
+    /// Host → uploading peer: tells the peer what track_id was assigned so
+    /// the peer can cache the file locally without receiving it back.
+    SongUploadAssigned { file_id: Uuid },
 
     // Playback control
     PlayCommand { file_id: Uuid, position_samples: u64, target_time_ns: u64, sample_rate: u32 },
@@ -338,6 +341,13 @@ mod tests {
         roundtrip_message(&Message::SongUploadComplete {
             request_id: Uuid::new_v4(),
             sha256: [0xCD; 32],
+        });
+    }
+
+    #[test]
+    fn test_song_upload_assigned() {
+        roundtrip_message(&Message::SongUploadAssigned {
+            file_id: Uuid::new_v4(),
         });
     }
 
