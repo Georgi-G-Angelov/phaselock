@@ -2292,27 +2292,27 @@ pub async fn remove_from_queue(app: AppHandle, track_id: String) -> Result<(), S
     let state = app.state::<AppState>();
     let session = state.session.lock().await;
 
-    match &*session {
-        Session::Host(_host) => {
-            let id: Uuid = track_id.parse().map_err(|e| format!("Invalid track ID: {e}"))?;
-            let mut queue = state.queue.lock().await;
-            if !queue.remove(id) {
-                return Err("Track not found in queue.".into());
-            }
-            let queue_items = queue.get_queue();
-            drop(queue);
-
-            emit_queue_update(&app, &queue_items);
-
-            // Evict decoded entries outside the new playback window.
-            evict_decoded_cache(&state).await;
-            backfill_decoded_cache(&app, &state).await;
-
-            log::info!("Removed track {id} from queue");
-            Ok(())
-        }
-        _ => Err("Only the host can modify the queue.".into()),
+    if !matches!(&*session, Session::Host(_)) {
+        return Err("Only the host can modify the queue.".into());
     }
+    drop(session);
+
+    let id: Uuid = track_id.parse().map_err(|e| format!("Invalid track ID: {e}"))?;
+    let mut queue = state.queue.lock().await;
+    if !queue.remove(id) {
+        return Err("Track not found in queue.".into());
+    }
+    let queue_items = queue.get_queue();
+    drop(queue);
+
+    emit_queue_update(&app, &queue_items);
+
+    // Evict decoded entries outside the new playback window.
+    evict_decoded_cache(&state).await;
+    backfill_decoded_cache(&app, &state).await;
+
+    log::info!("Removed track {id} from queue");
+    Ok(())
 }
 
 #[tauri::command]
@@ -2320,26 +2320,26 @@ pub async fn reorder_queue(app: AppHandle, from_index: usize, to_index: usize) -
     let state = app.state::<AppState>();
     let session = state.session.lock().await;
 
-    match &*session {
-        Session::Host(_host) => {
-            let mut queue = state.queue.lock().await;
-            if !queue.reorder(from_index, to_index) {
-                return Err("Invalid indices for reorder.".into());
-            }
-            let queue_items = queue.get_queue();
-            drop(queue);
-            // Evict decoded entries outside the new playback window.
-            evict_decoded_cache(&state).await;
-            backfill_decoded_cache(&app, &state).await;
-
-            
-            emit_queue_update(&app, &queue_items);
-
-            log::info!("Reordered queue: {} → {}", from_index, to_index);
-            Ok(())
-        }
-        _ => Err("Only the host can reorder the queue.".into()),
+    if !matches!(&*session, Session::Host(_)) {
+        return Err("Only the host can reorder the queue.".into());
     }
+    drop(session);
+
+    let mut queue = state.queue.lock().await;
+    if !queue.reorder(from_index, to_index) {
+        return Err("Invalid indices for reorder.".into());
+    }
+    let queue_items = queue.get_queue();
+    drop(queue);
+
+    // Evict decoded entries outside the new playback window.
+    evict_decoded_cache(&state).await;
+    backfill_decoded_cache(&app, &state).await;
+
+    emit_queue_update(&app, &queue_items);
+
+    log::info!("Reordered queue: {} → {}", from_index, to_index);
+    Ok(())
 }
 
 // ── Song Request Commands ───────────────────────────────────────────────────
