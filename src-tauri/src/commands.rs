@@ -478,7 +478,12 @@ pub async fn create_session(
                                 let latencies = udp.tracker.lock().get_all_latencies();
                                 if !latencies.is_empty() {
                                     for (peer_id, lat_ns) in &latencies {
-                                        log::info!("[latency] peer {peer_id}: {:.2} ms one-way", *lat_ns as f64 / 1_000_000.0);
+                                        let latency_ms = *lat_ns as f64 / 1_000_000.0;
+                                        log::info!("[latency] peer {peer_id}: {:.2} ms one-way", latency_ms);
+                                        let _ = app_for_latency.emit(
+                                            "sync:latency-updated",
+                                            SyncLatencyPayload { peer_id: *peer_id, latency_ms },
+                                        );
                                     }
                                 }
                                 // Update the session info for UDP broadcast.
