@@ -156,6 +156,8 @@ pub struct AppState {
     pub device_sample_rate: ParkingMutex<Option<u32>>,
     /// Handle to the latency-logging ticker task (aborted on session leave).
     pub latency_ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Peer-side: file_id of the track currently loaded/playing in AudioOutput.
+    pub peer_current_file_id: ParkingMutex<Option<Uuid>>,
 }
 
 impl AppState {
@@ -178,6 +180,7 @@ impl AppState {
             decoded_cache: Mutex::new(HashMap::new()),
             device_sample_rate: ParkingMutex::new(None),
             latency_ticker: Mutex::new(None),
+            peer_current_file_id: ParkingMutex::new(None),
         }
     }
 }
@@ -637,19 +640,27 @@ pub async fn join_session(
                                         let received_at = std::time::Instant::now();
                                         let s = app_clone.state::<AppState>();
 
-                                        // Check current peer playback state.
-                                        let peer_state = {
+                                        // Check current peer playback state and which file is loaded.
+                                        let (peer_state, peer_file_id) = {
                                             let audio = s.audio_output.lock().await;
-                                            if let Some(ref ao) = *audio {
+                                            let st = if let Some(ref ao) = *audio {
                                                 ao.get_state()
                                             } else {
                                                 crate::audio::playback::PlaybackStateEnum::Stopped
-                                            }
+                                            };
+                                            let fid = *s.peer_current_file_id.lock();
+                                            (st, fid)
                                         };
 
                                         use crate::audio::playback::PlaybackStateEnum;
 
-                                        if peer_state == PlaybackStateEnum::Paused {
+                                        // Determine if we need to catch up.
+                                        let same_file = peer_file_id == Some(file_id);
+                                        let needs_full_catchup = peer_state == PlaybackStateEnum::Stopped
+                                            || (peer_state == PlaybackStateEnum::Playing && !same_file)
+                                            || (peer_state == PlaybackStateEnum::Waiting && !same_file);
+
+                                        if peer_state == PlaybackStateEnum::Paused && same_file {
                                             // ── Fast path: track already loaded, just seek & resume ──
                                             log::info!("[peer] Catch-up: peer is paused, resuming at host position for {file_id}");
 
@@ -677,9 +688,12 @@ pub async fn join_session(
                                                     processing_ns as f64 / 1_000_000.0,
                                                 );
                                             }
-                                        } else if peer_state == PlaybackStateEnum::Stopped {
+                                        } else if needs_full_catchup {
                                             // ── Full path: need to decode and load the track ──
-                                            log::info!("[peer] Catch-up: host is playing but we are stopped — attempting to start playback for {file_id}");
+                                            if !same_file && (peer_state == PlaybackStateEnum::Playing || peer_state == PlaybackStateEnum::Waiting) {
+                                                log::info!("[peer] Catch-up: peer is playing a different file — switching to {file_id}");
+                                            }
+                                            log::info!("[peer] Catch-up: host is playing but peer needs new track — attempting to start playback for {file_id}");
 
                                             // Try pre-decoded cache first, then raw file cache.
                                             let pre_decoded = {
@@ -755,6 +769,7 @@ pub async fn join_session(
                                                 if adjusted > 0 {
                                                     ao.seek(adjusted);
                                                 }
+                                                *s.peer_current_file_id.lock() = Some(file_id);
                                                 log::info!(
                                                     "[peer] Catch-up: playing {file_id} at frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
                                                     latency_ns as f64 / 1_000_000.0,
@@ -762,7 +777,7 @@ pub async fn join_session(
                                                 );
                                             }
                                         }
-                                        // Playing or Waiting — already in the right state, no catch-up needed.
+                                        // else: Playing/Waiting the same file — already in the right state.
                                     }
 
                                     // Always emit the UI event.
@@ -931,11 +946,21 @@ pub async fn join_session(
                                         if adjusted > 0 {
                                             ao.seek(adjusted);
                                         }
+                                        *s.peer_current_file_id.lock() = Some(file_id);
                                         log::info!(
                                             "Peer: playing file {file_id} at frame {adjusted} (comp +{comp} frames: {:.2} ms network + {:.2} ms processing)",
                                             latency_ns as f64 / 1_000_000.0,
                                             processing_ns as f64 / 1_000_000.0,
                                         );
+                                    } else {
+                                        // File not in cache — stop current playback so peer
+                                        // doesn't keep playing a different song than the host.
+                                        let audio = s.audio_output.lock().await;
+                                        if let Some(ref ao) = *audio {
+                                            ao.stop();
+                                        }
+                                        *s.peer_current_file_id.lock() = None;
+                                        log::warn!("Peer: stopped playback — PlayCommand for {file_id} but file not available");
                                     }
                                 }
                                 Message::PauseCommand { position_samples, sample_rate: host_sr } => {
@@ -953,6 +978,7 @@ pub async fn join_session(
                                     let audio = s.audio_output.lock().await;
                                     if let Some(ref ao) = *audio {
                                         ao.stop();
+                                        *s.peer_current_file_id.lock() = None;
                                         log::info!("Peer: stopped");
                                     }
                                 }
