@@ -87,8 +87,11 @@
                 playbackStore.set(e.payload);
             }),
             await listen<PlaybackPosition>(EVENTS.PLAYBACK_POSITION, (e) => {
-                console.log('[PeerSession] PLAYBACK_POSITION:', e.payload.position_ms, '/', e.payload.duration_ms);
-                playbackStore.update(s => ({ ...s, position_ms: e.payload.position_ms, duration_ms: e.payload.duration_ms }));
+                playbackStore.update(s => ({
+                    ...s,
+                    position_ms: e.payload.position_ms,
+                    ...(e.payload.duration_ms > 0 ? { duration_ms: e.payload.duration_ms } : {}),
+                }));
             }),
             await listen(EVENTS.SESSION_ENDED, () => {
                 toast?.show('Host ended the session.', 'info');

@@ -705,6 +705,8 @@ pub async fn join_session(
 
                                                 ao.seek(adjusted);
                                                 ao.resume_at(std::time::Instant::now());
+                                                drop(audio);
+                                                start_peer_position_ticker(&app_clone, &s).await;
                                                 log::info!(
                                                     "[peer] Catch-up: resumed {file_id} at frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
                                                     latency_ns as f64 / 1_000_000.0,
@@ -793,6 +795,8 @@ pub async fn join_session(
                                                     ao.seek(adjusted);
                                                 }
                                                 *s.peer_current_file_id.lock() = Some(file_id);
+                                                drop(audio);
+                                                start_peer_position_ticker(&app_clone, &s).await;
                                                 log::info!(
                                                     "[peer] Catch-up: playing {file_id} at frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
                                                     latency_ns as f64 / 1_000_000.0,
@@ -970,6 +974,8 @@ pub async fn join_session(
                                             ao.seek(adjusted);
                                         }
                                         *s.peer_current_file_id.lock() = Some(file_id);
+                                        drop(audio);
+                                        start_peer_position_ticker(&app_clone, &s).await;
                                         log::info!(
                                             "Peer: playing file {file_id} at frame {adjusted} (comp +{comp} frames: {:.2} ms network + {:.2} ms processing)",
                                             latency_ns as f64 / 1_000_000.0,
@@ -988,6 +994,7 @@ pub async fn join_session(
                                 }
                                 Message::PauseCommand { position_samples, sample_rate: host_sr } => {
                                     let s = app_clone.state::<AppState>();
+                                    stop_position_ticker(&s).await;
                                     let audio = s.audio_output.lock().await;
                                     if let Some(ref ao) = *audio {
                                         let adjusted = convert_sample_position(position_samples, host_sr, ao.device_sample_rate);
@@ -998,6 +1005,7 @@ pub async fn join_session(
                                 }
                                 Message::StopCommand => {
                                     let s = app_clone.state::<AppState>();
+                                    stop_position_ticker(&s).await;
                                     let audio = s.audio_output.lock().await;
                                     if let Some(ref ao) = *audio {
                                         ao.stop();
@@ -1025,6 +1033,8 @@ pub async fn join_session(
 
                                         ao.seek(adjusted);
                                         ao.resume_at(std::time::Instant::now());
+                                        drop(audio);
+                                        start_peer_position_ticker(&app_clone, &s).await;
                                         log::info!(
                                             "Peer: resumed at frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
                                             latency_ns as f64 / 1_000_000.0,
@@ -1052,6 +1062,8 @@ pub async fn join_session(
 
                                         ao.seek(adjusted);
                                         ao.resume_at(std::time::Instant::now());
+                                        drop(audio);
+                                        start_peer_position_ticker(&app_clone, &s).await;
                                         log::info!(
                                             "Peer: seeked to frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
                                             latency_ns as f64 / 1_000_000.0,
@@ -1964,4 +1976,59 @@ pub async fn stop_position_ticker(state: &AppState) {
     if let Some(handle) = ticker.take() {
         handle.abort();
     }
+}
+
+/// Peer-side position ticker: emits `playback:position` so the progress bar
+/// updates smoothly. Does NOT auto-advance or broadcast to peers.
+pub async fn start_peer_position_ticker(
+    app: &AppHandle,
+    state: &AppState,
+) {
+    // Stop any existing ticker first.
+    stop_position_ticker(state).await;
+
+    let app_clone = app.clone();
+    let playback_state = {
+        let audio = state.audio_output.lock().await;
+        audio.as_ref().map(|ao| ao.playback_state())
+    };
+
+    let handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(250));
+        loop {
+            interval.tick().await;
+
+            let position_ms = if let Some(ref ps) = playback_state {
+                let pos_samples = ps.position.load(std::sync::atomic::Ordering::Acquire) as u64;
+                let channels = ps.channels.load(std::sync::atomic::Ordering::Acquire) as u64;
+                let sr = ps.sample_rate.load(std::sync::atomic::Ordering::Acquire) as u64;
+                if sr > 0 && channels > 0 {
+                    let frames = pos_samples / channels;
+                    (frames * 1000) / sr
+                } else {
+                    0
+                }
+            } else {
+                break;
+            };
+
+            // Check if audio stopped (track ended or was stopped).
+            let is_stopped = playback_state.as_ref().map_or(true, |ps| {
+                ps.state.load(std::sync::atomic::Ordering::Acquire) == 0 // STATE_STOPPED
+            });
+            if is_stopped {
+                break;
+            }
+
+            let _ = app_clone.emit(
+                "playback:position",
+                PlaybackPositionPayload {
+                    position_ms,
+                    duration_ms: 0, // Peer gets duration from state-changed events
+                },
+            );
+        }
+    });
+
+    *state.position_ticker.lock().await = Some(handle);
 }
