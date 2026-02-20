@@ -18,14 +18,20 @@
 
     async function requestSong() {
         const selected = await open({
-            multiple: false,
+            multiple: true,
             filters: [{ name: 'Audio', extensions: ['mp3'] }],
         });
         if (selected) {
+            const paths = Array.isArray(selected) ? selected : [selected];
             requestPending = true;
             try {
-                await invoke('request_song', { filePath: selected });
-                dispatch('toast-message', { message: 'Song request sent!', variant: 'success' });
+                for (const filePath of paths) {
+                    await invoke('request_song', { filePath });
+                }
+                dispatch('toast-message', {
+                    message: paths.length === 1 ? 'Song request sent!' : `${paths.length} song requests sent!`,
+                    variant: 'success',
+                });
             } catch (e) {
                 dispatch('toast-message', { message: `Request failed: ${e}`, variant: 'error' });
             } finally {
