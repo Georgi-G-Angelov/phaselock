@@ -21,7 +21,7 @@ pub enum Message {
 
     // Song requests
     SongRequest { file_name: String, file_size: u64 },
-    SongRequestAccepted { request_id: Uuid },
+    SongRequestAccepted { request_id: Uuid, file_name: String },
     SongRequestRejected { request_id: Uuid },
     SongUploadChunk { request_id: Uuid, offset: u64, data: Vec<u8> },
     SongUploadComplete { request_id: Uuid, sha256: [u8; 32] },
@@ -313,6 +313,7 @@ mod tests {
     fn test_song_request_accepted() {
         roundtrip_message(&Message::SongRequestAccepted {
             request_id: Uuid::new_v4(),
+            file_name: "test.mp3".into(),
         });
     }
 

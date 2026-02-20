@@ -170,6 +170,8 @@ pub struct AppState {
     pub latency_ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Peer-side: file_id of the track currently loaded/playing in AudioOutput.
     pub peer_current_file_id: ParkingMutex<Option<Uuid>>,
+    /// Peer-side: maps file_name → file_path for pending song requests awaiting host accept.
+    pub pending_request_paths: ParkingMutex<HashMap<String, String>>,
 }
 
 impl AppState {
@@ -193,6 +195,7 @@ impl AppState {
             device_sample_rate: ParkingMutex::new(None),
             latency_ticker: Mutex::new(None),
             peer_current_file_id: ParkingMutex::new(None),
+            pending_request_paths: ParkingMutex::new(HashMap::new()),
         }
     }
 }
@@ -494,6 +497,116 @@ pub async fn create_session(
                                         }
                                         Err(reason) => {
                                             log::warn!("[host] Auto-rejected song request from peer {peer_id}: {reason:?}");
+                                        }
+                                    }
+                                }
+                                Message::SongUploadChunk { request_id, offset, data } => {
+                                    let s = app_clone.state::<AppState>();
+                                    let mut requests = s.song_requests.lock().await;
+                                    if !requests.receive_chunk(request_id, offset, &data) {
+                                        log::warn!("[host] Rejected upload chunk for {request_id}");
+                                    }
+                                }
+                                Message::SongUploadComplete { request_id, sha256 } => {
+                                    log::info!("[host] Upload complete for request {request_id}, verifying hash...");
+                                    let s = app_clone.state::<AppState>();
+                                    let mut requests = s.song_requests.lock().await;
+                                    match requests.complete_upload(request_id, sha256) {
+                                        Some(crate::transfer::song_request::UploadResult::Success {
+                                            file_name, file_data, ..
+                                        }) => {
+                                            drop(requests);
+                                            log::info!("[host] Song upload verified: \"{file_name}\" ({} bytes)", file_data.len());
+
+                                            // Validate MP3 by decoding.
+                                            let file_data_clone = file_data.clone();
+                                            let decoded = match tokio::task::spawn_blocking(move || {
+                                                crate::audio::decoder::decode_mp3(&file_data_clone)
+                                            }).await {
+                                                Ok(Ok(d)) => d,
+                                                Ok(Err(e)) => {
+                                                    log::error!("[host] Uploaded file is not a valid MP3: {e}");
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    log::error!("[host] Decode task failed: {e}");
+                                                    continue;
+                                                }
+                                            };
+                                            let duration_secs = decoded.duration_secs;
+
+                                            // Pre-resample if needed.
+                                            let target_rate = *s.device_sample_rate.lock();
+                                            let cached_decoded = if let Some(dev_rate) = target_rate {
+                                                if decoded.sample_rate != dev_rate {
+                                                    log::info!("[host] Pre-resampling uploaded track from {} Hz to {} Hz", decoded.sample_rate, dev_rate);
+                                                    let resampled = AudioOutput::resample(
+                                                        &decoded.samples,
+                                                        decoded.channels,
+                                                        decoded.sample_rate,
+                                                        dev_rate,
+                                                    );
+                                                    let new_frames = resampled.len() as u64 / decoded.channels as u64;
+                                                    let new_duration = new_frames as f64 / dev_rate as f64;
+                                                    crate::audio::decoder::DecodedAudio {
+                                                        samples: resampled,
+                                                        sample_rate: dev_rate,
+                                                        channels: decoded.channels,
+                                                        total_frames: new_frames,
+                                                        duration_secs: new_duration,
+                                                    }
+                                                } else {
+                                                    decoded
+                                                }
+                                            } else {
+                                                decoded
+                                            };
+
+                                            // Add to queue.
+                                            let mut queue = s.queue.lock().await;
+                                            let track_id = queue.add(file_name.clone(), duration_secs, format!("peer {peer_id}"));
+                                            queue.mark_ready(track_id);
+                                            let queue_items = queue.get_queue();
+                                            drop(queue);
+
+                                            // Store raw file data and pre-decoded cache.
+                                            s.track_data.lock().await.insert(track_id, file_data.clone());
+                                            s.decoded_cache.lock().await.insert(track_id, cached_decoded);
+                                            log::info!("[host] Pre-cached decoded audio for uploaded track {track_id}");
+
+                                            // Transfer the file to all connected peers.
+                                            let session = s.session.lock().await;
+                                            if let Session::Host(ref host) = *session {
+                                                let all_peer_ids: Vec<u32> = host.peers.lock().keys().copied().collect();
+                                                if !all_peer_ids.is_empty() {
+                                                    let tcp_host = host.tcp_host.clone();
+                                                    drop(session);
+                                                    let mut mgr = s.file_transfer_mgr.lock().await;
+                                                    if let Err(e) = mgr.start_transfer_with_id(
+                                                        track_id,
+                                                        file_name.clone(),
+                                                        file_data,
+                                                        &all_peer_ids,
+                                                        &tcp_host,
+                                                    ).await {
+                                                        log::warn!("[host] Failed to transfer uploaded file to peers: {e}");
+                                                    }
+                                                } else {
+                                                    drop(session);
+                                                }
+                                            } else {
+                                                drop(session);
+                                            }
+
+                                            emit_queue_update(&app_clone, &queue_items);
+                                            log::info!("[host] Added uploaded song \"{}\" to queue ({})", file_name, track_id);
+                                        }
+                                        Some(crate::transfer::song_request::UploadResult::HashMismatch { request_id }) => {
+                                            drop(requests);
+                                            log::error!("[host] Upload hash mismatch for request {request_id}");
+                                        }
+                                        None => {
+                                            log::warn!("[host] No active upload found for request {request_id}");
                                         }
                                     }
                                 }
@@ -1112,6 +1225,59 @@ pub async fn join_session(
                                             processing_ns as f64 / 1_000_000.0,
                                         );
                                     }
+                                }
+                                Message::SongRequestAccepted { request_id, file_name } => {
+                                    log::info!("[peer] Song request {request_id} accepted — uploading \"{file_name}\"");
+                                    let s = app_clone.state::<AppState>();
+
+                                    // Look up the local file path we stored when sending the request.
+                                    let file_path = s.pending_request_paths.lock().remove(&file_name);
+
+                                    if let Some(path) = file_path {
+                                        // Read the file.
+                                        match tokio::fs::read(&path).await {
+                                            Ok(file_data) => {
+                                                let sha256 = crate::transfer::file_transfer::compute_sha256(&file_data);
+
+                                                // Upload in chunks.
+                                                let chunk_size = crate::transfer::song_request::UPLOAD_CHUNK_SIZE;
+                                                let mut offset: u64 = 0;
+                                                for chunk in file_data.chunks(chunk_size) {
+                                                    let msg = Message::SongUploadChunk {
+                                                        request_id,
+                                                        offset,
+                                                        data: chunk.to_vec(),
+                                                    };
+                                                    let mut session = s.session.lock().await;
+                                                    if let Session::Peer(ref mut peer) = *session {
+                                                        if let Err(e) = peer.send(&msg).await {
+                                                            log::error!("[peer] Failed to send upload chunk: {e}");
+                                                            break;
+                                                        }
+                                                    }
+                                                    offset += chunk.len() as u64;
+                                                }
+
+                                                // Send completion with hash.
+                                                let msg = Message::SongUploadComplete { request_id, sha256 };
+                                                let mut session = s.session.lock().await;
+                                                if let Session::Peer(ref mut peer) = *session {
+                                                    let _ = peer.send(&msg).await;
+                                                }
+                                                log::info!("[peer] Upload complete for request {request_id} ({} bytes)", file_data.len());
+                                            }
+                                            Err(e) => {
+                                                log::error!("[peer] Failed to read file \"{path}\": {e}");
+                                            }
+                                        }
+                                    } else {
+                                        log::warn!("[peer] No stored file path for accepted request \"{file_name}\"");
+                                    }
+                                }
+                                Message::SongRequestRejected { request_id } => {
+                                    log::info!("[peer] Song request {request_id} was rejected by host");
+                                    // Clean up — we don't know the file_name from this message,
+                                    // but it's fine to leave it; it'll be cleaned on session end.
                                 }
                                 _ => {}
                             }
@@ -1799,13 +1965,19 @@ pub async fn request_song(app: AppHandle, file_path: String) -> Result<(), Strin
             }
 
             let msg = Message::SongRequest {
-                file_name,
+                file_name: file_name.clone(),
                 file_size: metadata.len(),
             };
 
             peer.send(&msg)
                 .await
                 .map_err(|e| format!("Failed to send song request: {e}"))?;
+
+            // Store the file path so we can upload it when the host accepts.
+            {
+                let s = app.state::<AppState>();
+                s.pending_request_paths.lock().insert(file_name, file_path.clone());
+            }
 
             log::info!("Sent song request for \"{}\"", file_path);
             Ok(())
@@ -1827,7 +1999,10 @@ pub async fn accept_song_request(app: AppHandle, request_id: String) -> Result<(
             let req = requests.accept(id).ok_or("Request not found.")?;
 
             // Send acceptance to the requesting peer.
-            let msg = crate::network::messages::Message::SongRequestAccepted { request_id: id };
+            let msg = crate::network::messages::Message::SongRequestAccepted {
+                request_id: id,
+                file_name: req.file_name.clone(),
+            };
             host.send_to_peer(req.peer_id, &msg).await;
 
             log::info!("Accepted song request {} from peer {}", id, req.peer_id);

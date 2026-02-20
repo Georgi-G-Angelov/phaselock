@@ -19,6 +19,7 @@
         processing = processing; // trigger reactivity
         try {
             await invoke('accept_song_request', { requestId });
+            songRequests.update(r => r.filter(req => req.request_id !== requestId));
         } catch (e) {
             console.error('Failed to accept song request:', e);
         } finally {
@@ -32,6 +33,7 @@
         processing = processing;
         try {
             await invoke('reject_song_request', { requestId });
+            songRequests.update(r => r.filter(req => req.request_id !== requestId));
         } catch (e) {
             console.error('Failed to reject song request:', e);
         } finally {
