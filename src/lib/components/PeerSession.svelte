@@ -173,7 +173,10 @@
         <!-- Left panel: Listeners -->
         <aside class="listeners-sidebar flex-col p-4">
             <div class="listeners-panel panel flex-col gap-3">
-                <h4>Listeners</h4>
+                <div class="flex items-center justify-between">
+                    <h4>Listeners</h4>
+                    <span class="text-sm text-secondary">{$listenersStore ? 1 + $listenersStore.listeners.length : '—'}</span>
+                </div>
                 {#if $listenersStore}
                     <!-- Host entry -->
                     <div class="listener-item flex items-center gap-2 p-2">

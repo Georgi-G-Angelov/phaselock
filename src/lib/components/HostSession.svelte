@@ -80,7 +80,7 @@
         confirmingEnd = false;
     }
 
-    $: peerCount = $peersStore.length;
+    $: listenerCount = $peersStore.length + 1;
 </script>
 
 <Toast bind:this={toast} />
@@ -90,7 +90,7 @@
         <div class="flex items-center gap-2">
             <h3>🎵 {$sessionStore?.session_name ?? 'Your Jam'}</h3>
         </div>
-        <span class="text-sm text-secondary">{peerCount} {peerCount === 1 ? 'peer' : 'peers'} connected</span>
+        <span class="text-sm text-secondary">{listenerCount} {listenerCount === 1 ? 'listener' : 'listeners'}</span>
         <div class="flex items-center gap-2">
             {#if confirmingEnd}
                 <span class="text-sm text-error">End session?</span>

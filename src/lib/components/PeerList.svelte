@@ -2,7 +2,7 @@
     import { onMount, onDestroy } from 'svelte';
     import { listen } from '@tauri-apps/api/event';
     import type { UnlistenFn } from '@tauri-apps/api/event';
-    import { peersStore } from '../stores/session';
+    import { peersStore, sessionStore } from '../stores/session';
     import { EVENTS } from '../types';
     import type { SyncLatency } from '../types';
 
@@ -37,14 +37,20 @@
 <div class="peer-list panel flex-col gap-3">
     <div class="flex items-center justify-between">
         <h4>Listeners</h4>
-        <span class="text-sm text-secondary">{$peersStore.length}</span>
+        <span class="text-sm text-secondary">{$peersStore.length + 1}</span>
     </div>
 
-    {#if $peersStore.length === 0}
-        <p class="text-secondary text-sm">Waiting for peers to join…</p>
-    {:else}
-        <div class="peers flex-col gap-1">
-            {#each $peersStore as peer (peer.peer_id)}
+    <div class="peers flex-col gap-1">
+        <!-- Host entry -->
+        <div class="peer-item flex items-center gap-2 p-2">
+            <span class="peer-avatar host-avatar flex-center flex-shrink-0">
+                {($sessionStore?.host_name ?? 'H').charAt(0).toUpperCase()}
+            </span>
+            <span class="text-sm text-ellipsis flex-1">{$sessionStore?.host_name ?? 'Host'}</span>
+            <span class="text-xs badge-host">Host</span>
+        </div>
+
+        {#each $peersStore as peer (peer.peer_id)}
                 {@const ms = latencies.get(peer.peer_id)}
                 <div class="peer-item flex items-center gap-2 p-2">
                     <span
@@ -57,9 +63,8 @@
                     <span class="text-sm text-ellipsis flex-1">{peer.display_name}</span>
                     <span class="text-xs text-secondary flex-shrink-0">{latencyLabel(ms)}</span>
                 </div>
-            {/each}
-        </div>
-    {/if}
+        {/each}
+    </div>
 </div>
 
 <style>
@@ -81,5 +86,18 @@
 
     .peer-item {
         border-radius: var(--radius-sm);
+    }
+
+    .host-avatar {
+        color: var(--bg-base);
+        background: var(--accent-green);
+    }
+
+    .badge-host {
+        background: var(--accent-green);
+        color: var(--bg-base);
+        padding: 0.1rem 0.4rem;
+        border-radius: var(--radius-sm);
+        font-weight: 600;
     }
 </style>
