@@ -720,10 +720,10 @@ pub async fn join_session(
                                                 let comp = latency_compensation_frames(total_delay_ns, peer_sr);
                                                 adjusted += comp;
 
+                                                ao.play_at(std::time::Instant::now());
                                                 if adjusted > 0 {
                                                     ao.seek(adjusted);
                                                 }
-                                                ao.play_at(std::time::Instant::now());
                                                 log::info!(
                                                     "[peer] Catch-up: playing {file_id} at frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
                                                     latency_ns as f64 / 1_000_000.0,
@@ -895,10 +895,10 @@ pub async fn join_session(
                                         let comp = latency_compensation_frames(total_delay_ns, peer_sr);
                                         adjusted += comp;
 
+                                        ao.play_at(std::time::Instant::now());
                                         if adjusted > 0 {
                                             ao.seek(adjusted);
                                         }
-                                        ao.play_at(std::time::Instant::now());
                                         log::info!(
                                             "Peer: playing file {file_id} at frame {adjusted} (comp +{comp} frames: {:.2} ms network + {:.2} ms processing)",
                                             latency_ns as f64 / 1_000_000.0,
