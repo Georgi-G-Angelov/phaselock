@@ -430,29 +430,40 @@ pub async fn create_session(
                                     if !missing.is_empty() {
                                         log::info!("[host] Peer {peer_id} is missing {} file(s): {:?}", missing.len(), missing);
                                         let tcp_host = s.host_tcp.lock().clone();
-                                        let track_store = s.track_data.lock().await;
-                                        log::info!("[host] track_data has {} entries", track_store.len());
                                         if let Some(tcp_host) = tcp_host {
-                                            let mut mgr = s.file_transfer_mgr.lock().await;
-                                            for file_id in missing {
-                                                if let Some(data) = track_store.get(&file_id) {
-                                                    let queue = s.queue.lock().await;
-                                                    let file_name = queue.get_queue().iter()
-                                                        .find(|q| q.id == file_id)
+                                            // Gather data needed for transfer without holding locks long-term.
+                                            let track_store = s.track_data.lock().await;
+                                            let queue_lock = s.queue.lock().await;
+                                            let mut files_to_transfer: Vec<(Uuid, String, Vec<u8>)> = Vec::new();
+                                            for file_id in &missing {
+                                                if let Some(data) = track_store.get(file_id) {
+                                                    let file_name = queue_lock.get_queue().iter()
+                                                        .find(|q| q.id == *file_id)
                                                         .map(|q| q.file_name.clone())
                                                         .unwrap_or_default();
-                                                    drop(queue);
+                                                    files_to_transfer.push((*file_id, file_name, data.clone()));
+                                                }
+                                            }
+                                            drop(queue_lock);
+                                            drop(track_store);
+
+                                            // Spawn transfer in background so event loop stays responsive.
+                                            let app_for_transfer = app_clone.clone();
+                                            tokio::spawn(async move {
+                                                let s = app_for_transfer.state::<AppState>();
+                                                let mut mgr = s.file_transfer_mgr.lock().await;
+                                                for (file_id, file_name, data) in files_to_transfer {
                                                     if let Err(e) = mgr.start_transfer_with_id(
                                                         file_id,
                                                         file_name.clone(),
-                                                        data.clone(),
+                                                        data,
                                                         &[peer_id],
                                                         &tcp_host,
                                                     ).await {
                                                         log::warn!("Failed to transfer \"{file_name}\" to peer {peer_id}: {e}");
                                                     }
                                                 }
-                                            }
+                                            });
                                         }
                                     } else {
                                         log::info!("Peer {peer_id} already has all files");
@@ -516,90 +527,103 @@ pub async fn create_session(
                                             file_name, file_data, ..
                                         }) => {
                                             drop(requests);
-                                            log::info!("[host] Song upload verified: \"{file_name}\" ({} bytes)", file_data.len());
+                                            log::info!("[host] Song upload verified: \"{file_name}\" ({} bytes) — processing in background", file_data.len());
 
-                                            // Validate MP3 by decoding.
-                                            let file_data_clone = file_data.clone();
-                                            let decoded = match tokio::task::spawn_blocking(move || {
-                                                crate::audio::decoder::decode_mp3(&file_data_clone)
-                                            }).await {
-                                                Ok(Ok(d)) => d,
-                                                Ok(Err(e)) => {
-                                                    log::error!("[host] Uploaded file is not a valid MP3: {e}");
-                                                    continue;
-                                                }
-                                                Err(e) => {
-                                                    log::error!("[host] Decode task failed: {e}");
-                                                    continue;
-                                                }
-                                            };
-                                            let duration_secs = decoded.duration_secs;
+                                            // Spawn entire decode→resample→queue→transfer pipeline
+                                            // in background so the host event loop stays responsive.
+                                            let app_for_upload = app_clone.clone();
+                                            tokio::spawn(async move {
+                                                let s = app_for_upload.state::<AppState>();
 
-                                            // Pre-resample if needed.
-                                            let target_rate = *s.device_sample_rate.lock();
-                                            let cached_decoded = if let Some(dev_rate) = target_rate {
-                                                if decoded.sample_rate != dev_rate {
-                                                    log::info!("[host] Pre-resampling uploaded track from {} Hz to {} Hz", decoded.sample_rate, dev_rate);
-                                                    let resampled = AudioOutput::resample(
-                                                        &decoded.samples,
-                                                        decoded.channels,
-                                                        decoded.sample_rate,
-                                                        dev_rate,
-                                                    );
-                                                    let new_frames = resampled.len() as u64 / decoded.channels as u64;
-                                                    let new_duration = new_frames as f64 / dev_rate as f64;
-                                                    crate::audio::decoder::DecodedAudio {
-                                                        samples: resampled,
-                                                        sample_rate: dev_rate,
-                                                        channels: decoded.channels,
-                                                        total_frames: new_frames,
-                                                        duration_secs: new_duration,
+                                                // Validate MP3 by decoding.
+                                                let file_data_clone = file_data.clone();
+                                                let decoded = match tokio::task::spawn_blocking(move || {
+                                                    crate::audio::decoder::decode_mp3(&file_data_clone)
+                                                }).await {
+                                                    Ok(Ok(d)) => d,
+                                                    Ok(Err(e)) => {
+                                                        log::error!("[host] Uploaded file is not a valid MP3: {e}");
+                                                        return;
+                                                    }
+                                                    Err(e) => {
+                                                        log::error!("[host] Decode task failed: {e}");
+                                                        return;
+                                                    }
+                                                };
+                                                let duration_secs = decoded.duration_secs;
+
+                                                // Pre-resample if needed (on blocking thread).
+                                                let target_rate = *s.device_sample_rate.lock();
+                                                let cached_decoded = if let Some(dev_rate) = target_rate {
+                                                    if decoded.sample_rate != dev_rate {
+                                                        log::info!("[host] Pre-resampling uploaded track from {} Hz to {} Hz", decoded.sample_rate, dev_rate);
+                                                        match tokio::task::spawn_blocking(move || {
+                                                            let resampled = AudioOutput::resample(
+                                                                &decoded.samples,
+                                                                decoded.channels,
+                                                                decoded.sample_rate,
+                                                                dev_rate,
+                                                            );
+                                                            let new_frames = resampled.len() as u64 / decoded.channels as u64;
+                                                            let new_duration = new_frames as f64 / dev_rate as f64;
+                                                            crate::audio::decoder::DecodedAudio {
+                                                                samples: resampled,
+                                                                sample_rate: dev_rate,
+                                                                channels: decoded.channels,
+                                                                total_frames: new_frames,
+                                                                duration_secs: new_duration,
+                                                            }
+                                                        }).await {
+                                                            Ok(d) => d,
+                                                            Err(e) => {
+                                                                log::error!("[host] Resample task failed: {e}");
+                                                                return;
+                                                            }
+                                                        }
+                                                    } else {
+                                                        decoded
                                                     }
                                                 } else {
                                                     decoded
-                                                }
-                                            } else {
-                                                decoded
-                                            };
+                                                };
 
-                                            // Add to queue.
-                                            let mut queue = s.queue.lock().await;
-                                            let track_id = queue.add(file_name.clone(), duration_secs, format!("peer {peer_id}"));
-                                            queue.mark_ready(track_id);
-                                            let queue_items = queue.get_queue();
-                                            drop(queue);
+                                                // Add to queue.
+                                                let mut queue = s.queue.lock().await;
+                                                let track_id = queue.add(file_name.clone(), duration_secs, format!("peer {peer_id}"));
+                                                queue.mark_ready(track_id);
+                                                let queue_items = queue.get_queue();
+                                                drop(queue);
 
-                                            // Store raw file data and pre-decoded cache.
-                                            s.track_data.lock().await.insert(track_id, file_data.clone());
-                                            s.decoded_cache.lock().await.insert(track_id, cached_decoded);
-                                            log::info!("[host] Pre-cached decoded audio for uploaded track {track_id}");
+                                                // Store raw file data and pre-decoded cache.
+                                                s.track_data.lock().await.insert(track_id, file_data.clone());
+                                                s.decoded_cache.lock().await.insert(track_id, cached_decoded);
+                                                log::info!("[host] Pre-cached decoded audio for uploaded track {track_id}");
 
-                                            // Transfer the file to all connected peers.
-                                            let session = s.session.lock().await;
-                                            if let Session::Host(ref host) = *session {
-                                                let all_peer_ids: Vec<u32> = host.peers.lock().keys().copied().collect();
-                                                if !all_peer_ids.is_empty() {
-                                                    let tcp_host = host.tcp_host.clone();
-                                                    drop(session);
-                                                    let mut mgr = s.file_transfer_mgr.lock().await;
-                                                    if let Err(e) = mgr.start_transfer_with_id(
-                                                        track_id,
-                                                        file_name.clone(),
-                                                        file_data,
-                                                        &all_peer_ids,
-                                                        &tcp_host,
-                                                    ).await {
-                                                        log::warn!("[host] Failed to transfer uploaded file to peers: {e}");
+                                                // Transfer the file to all connected peers.
+                                                let tcp_host = s.host_tcp.lock().clone();
+                                                if let Some(tcp_host) = tcp_host {
+                                                    let session = s.session.lock().await;
+                                                    if let Session::Host(ref host) = *session {
+                                                        let all_peer_ids: Vec<u32> = host.peers.lock().keys().copied().collect();
+                                                        drop(session);
+                                                        if !all_peer_ids.is_empty() {
+                                                            let mut mgr = s.file_transfer_mgr.lock().await;
+                                                            if let Err(e) = mgr.start_transfer_with_id(
+                                                                track_id,
+                                                                file_name.clone(),
+                                                                file_data,
+                                                                &all_peer_ids,
+                                                                &tcp_host,
+                                                            ).await {
+                                                                log::warn!("[host] Failed to transfer uploaded file to peers: {e}");
+                                                            }
+                                                        }
                                                     }
-                                                } else {
-                                                    drop(session);
                                                 }
-                                            } else {
-                                                drop(session);
-                                            }
 
-                                            emit_queue_update(&app_clone, &queue_items);
-                                            log::info!("[host] Added uploaded song \"{}\" to queue ({})", file_name, track_id);
+                                                emit_queue_update(&app_for_upload, &queue_items);
+                                                log::info!("[host] Added uploaded song \"{}\" to queue ({})", file_name, track_id);
+                                            });
                                         }
                                         Some(crate::transfer::song_request::UploadResult::HashMismatch { request_id }) => {
                                             drop(requests);
@@ -875,37 +899,16 @@ pub async fn join_session(
                                             }
                                             log::info!("[peer] Catch-up: host is playing but peer needs new track — attempting to start playback for {file_id}");
 
-                                            // Try pre-decoded cache first, then raw file cache.
+                                            // Try pre-decoded cache first (instant).
                                             let pre_decoded = {
                                                 let mut dc = s.decoded_cache.lock().await;
                                                 dc.remove(&file_id)
                                             };
 
-                                            let decoded = if let Some(d) = pre_decoded {
+                                            if let Some(decoded) = pre_decoded {
+                                                // Fast path: pre-decoded cache hit — handle inline.
                                                 log::info!("[peer] Catch-up: using pre-decoded audio for {file_id}");
-                                                Some(d)
-                                            } else {
-                                                let file_data = {
-                                                    let cache = s.file_cache.lock().await;
-                                                    cache.get(&file_id).cloned()
-                                                };
-                                                if let Some(file_bytes) = file_data {
-                                                    log::info!("[peer] Catch-up: decoding {} bytes for {file_id}...", file_bytes.len());
-                                                    match tokio::task::spawn_blocking(move || {
-                                                        crate::audio::decoder::decode_mp3(&file_bytes)
-                                                    }).await {
-                                                        Ok(Ok(d)) => Some(d),
-                                                        Ok(Err(e)) => { log::error!("[peer] Catch-up: failed to decode MP3: {e}"); None }
-                                                        Err(e) => { log::error!("[peer] Catch-up: decode task failed: {e}"); None }
-                                                    }
-                                                } else {
-                                                    log::warn!("[peer] Catch-up: file {file_id} not in cache yet (still transferring?)");
-                                                    None
-                                                }
-                                            };
 
-                                            if let Some(decoded) = decoded {
-                                                // Read latency BEFORE acquiring audio lock (AudioOutput is !Send).
                                                 let latency_ns = {
                                                     let session = s.session.lock().await;
                                                     if let Session::Peer(ref peer) = *session {
@@ -922,7 +925,6 @@ pub async fn join_session(
                                                         }
                                                         Err(e) => {
                                                             log::error!("[peer] Catch-up: failed to init audio: {e}");
-                                                            // Still emit UI event below
                                                             let _ = app_clone.emit(
                                                                 "playback:state-changed",
                                                                 PlaybackStatePayload { state, file_name, position_ms, duration_ms },
@@ -938,8 +940,6 @@ pub async fn join_session(
 
                                                 let peer_sr = ao.device_sample_rate;
                                                 let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
-
-                                                // Compensate for network latency + local processing time.
                                                 let processing_ns = received_at.elapsed().as_nanos() as u64;
                                                 let total_delay_ns = latency_ns + processing_ns;
                                                 let comp = latency_compensation_frames(total_delay_ns, peer_sr);
@@ -957,6 +957,74 @@ pub async fn join_session(
                                                     latency_ns as f64 / 1_000_000.0,
                                                     processing_ns as f64 / 1_000_000.0,
                                                 );
+                                            } else {
+                                                // Slow path: decode needed — spawn in background
+                                                // so the event loop stays responsive to commands.
+                                                let file_data = {
+                                                    let cache = s.file_cache.lock().await;
+                                                    cache.get(&file_id).cloned()
+                                                };
+                                                if let Some(file_bytes) = file_data {
+                                                    let app_for_catchup = app_clone.clone();
+                                                    tokio::spawn(async move {
+                                                        let s = app_for_catchup.state::<AppState>();
+                                                        log::info!("[peer] Catch-up (bg): decoding {} bytes for {file_id}...", file_bytes.len());
+                                                        let decoded = match tokio::task::spawn_blocking(move || {
+                                                            crate::audio::decoder::decode_mp3(&file_bytes)
+                                                        }).await {
+                                                            Ok(Ok(d)) => d,
+                                                            Ok(Err(e)) => { log::error!("[peer] Catch-up (bg): failed to decode MP3: {e}"); return; }
+                                                            Err(e) => { log::error!("[peer] Catch-up (bg): decode task failed: {e}"); return; }
+                                                        };
+
+                                                        let latency_ns = {
+                                                            let session = s.session.lock().await;
+                                                            if let Session::Peer(ref peer) = *session {
+                                                                peer.clock_sync.lock().current_latency_ns
+                                                            } else { 0 }
+                                                        };
+
+                                                        let mut audio = s.audio_output.lock().await;
+                                                        if audio.is_none() {
+                                                            match AudioOutput::new() {
+                                                                Ok(ao) => {
+                                                                    *s.device_sample_rate.lock() = Some(ao.device_sample_rate);
+                                                                    *audio = Some(ao);
+                                                                }
+                                                                Err(e) => {
+                                                                    log::error!("[peer] Catch-up (bg): failed to init audio: {e}");
+                                                                    return;
+                                                                }
+                                                            }
+                                                        }
+                                                        let ao = audio.as_ref().unwrap();
+                                                        let vol = *s.volume.lock();
+                                                        ao.set_volume(vol);
+                                                        ao.load_track(decoded);
+
+                                                        let peer_sr = ao.device_sample_rate;
+                                                        let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
+                                                        let processing_ns = received_at.elapsed().as_nanos() as u64;
+                                                        let total_delay_ns = latency_ns + processing_ns;
+                                                        let comp = latency_compensation_frames(total_delay_ns, peer_sr);
+                                                        adjusted += comp;
+
+                                                        ao.play_at(std::time::Instant::now());
+                                                        if adjusted > 0 {
+                                                            ao.seek(adjusted);
+                                                        }
+                                                        *s.peer_current_file_id.lock() = Some(file_id);
+                                                        drop(audio);
+                                                        start_peer_position_ticker(&app_for_catchup, &s).await;
+                                                        log::info!(
+                                                            "[peer] Catch-up (bg): playing {file_id} at frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
+                                                            latency_ns as f64 / 1_000_000.0,
+                                                            processing_ns as f64 / 1_000_000.0,
+                                                        );
+                                                    });
+                                                } else {
+                                                    log::warn!("[peer] Catch-up: file {file_id} not in cache yet (still transferring?)");
+                                                }
                                             }
                                         }
                                         // else: Playing/Waiting the same file — already in the right state.
@@ -1063,33 +1131,10 @@ pub async fn join_session(
                                         dc.remove(&file_id)
                                     };
 
-                                    let decoded = if let Some(d) = pre_decoded {
+                                    if let Some(decoded) = pre_decoded {
+                                        // Fast path: pre-decoded cache hit — handle inline.
                                         log::info!("[peer] Using pre-decoded audio for {file_id}");
-                                        Some(d)
-                                    } else {
-                                        // Fall back to decoding from raw cache.
-                                        let file_data = {
-                                            let cache = s.file_cache.lock().await;
-                                            cache.get(&file_id).cloned()
-                                        };
-                                        if let Some(file_bytes) = file_data {
-                                            log::info!("[peer] No pre-decoded audio for {file_id}, decoding {} bytes...", file_bytes.len());
-                                            match tokio::task::spawn_blocking(move || {
-                                                crate::audio::decoder::decode_mp3(&file_bytes)
-                                            }).await {
-                                                Ok(Ok(d)) => Some(d),
-                                                Ok(Err(e)) => { log::error!("Peer: failed to decode MP3: {e}"); None }
-                                                Err(e) => { log::error!("Peer: decode task failed: {e}"); None }
-                                            }
-                                        } else {
-                                            log::warn!("Peer: PlayCommand for unknown file {file_id} — not in cache");
-                                            None
-                                        }
-                                    };
 
-                                    if let Some(decoded) = decoded {
-                                        // Read latency BEFORE acquiring the audio lock
-                                        // (AudioOutput is !Send, can't hold across .await).
                                         let latency_ns = {
                                             let session = s.session.lock().await;
                                             if let Session::Peer(ref peer) = *session {
@@ -1117,8 +1162,6 @@ pub async fn join_session(
 
                                         let peer_sr = ao.device_sample_rate;
                                         let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
-
-                                        // Compensate for network latency + local processing time.
                                         let processing_ns = received_at.elapsed().as_nanos() as u64;
                                         let total_delay_ns = latency_ns + processing_ns;
                                         let comp = latency_compensation_frames(total_delay_ns, peer_sr);
@@ -1137,25 +1180,108 @@ pub async fn join_session(
                                             processing_ns as f64 / 1_000_000.0,
                                         );
                                     } else {
-                                        // File not in cache — stop current playback so peer
-                                        // doesn't keep playing a different song than the host.
-                                        let audio = s.audio_output.lock().await;
-                                        if let Some(ref ao) = *audio {
-                                            ao.stop();
+                                        // Slow path: need to decode from raw file cache.
+                                        let file_data = {
+                                            let cache = s.file_cache.lock().await;
+                                            cache.get(&file_id).cloned()
+                                        };
+                                        if let Some(file_bytes) = file_data {
+                                            // Spawn decode+play in background so event loop
+                                            // stays responsive to pause/seek commands.
+                                            let app_for_play = app_clone.clone();
+                                            tokio::spawn(async move {
+                                                let s = app_for_play.state::<AppState>();
+                                                log::info!("[peer] PlayCommand (bg): decoding {} bytes for {file_id}...", file_bytes.len());
+                                                let decoded = match tokio::task::spawn_blocking(move || {
+                                                    crate::audio::decoder::decode_mp3(&file_bytes)
+                                                }).await {
+                                                    Ok(Ok(d)) => d,
+                                                    Ok(Err(e)) => { log::error!("Peer (bg): failed to decode MP3: {e}"); return; }
+                                                    Err(e) => { log::error!("Peer (bg): decode task failed: {e}"); return; }
+                                                };
+
+                                                let latency_ns = {
+                                                    let session = s.session.lock().await;
+                                                    if let Session::Peer(ref peer) = *session {
+                                                        peer.clock_sync.lock().current_latency_ns
+                                                    } else { 0 }
+                                                };
+
+                                                let mut audio = s.audio_output.lock().await;
+                                                if audio.is_none() {
+                                                    match AudioOutput::new() {
+                                                        Ok(ao) => {
+                                                            *s.device_sample_rate.lock() = Some(ao.device_sample_rate);
+                                                            *audio = Some(ao);
+                                                        }
+                                                        Err(e) => {
+                                                            log::error!("Peer (bg): failed to init audio: {e}");
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                                let ao = audio.as_ref().unwrap();
+                                                let vol = *s.volume.lock();
+                                                ao.set_volume(vol);
+                                                ao.load_track(decoded);
+
+                                                let peer_sr = ao.device_sample_rate;
+                                                let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
+                                                let processing_ns = received_at.elapsed().as_nanos() as u64;
+                                                let total_delay_ns = latency_ns + processing_ns;
+                                                let comp = latency_compensation_frames(total_delay_ns, peer_sr);
+                                                adjusted += comp;
+
+                                                ao.play_at(std::time::Instant::now());
+                                                if adjusted > 0 {
+                                                    ao.seek(adjusted);
+                                                }
+                                                *s.peer_current_file_id.lock() = Some(file_id);
+                                                drop(audio);
+                                                start_peer_position_ticker(&app_for_play, &s).await;
+                                                log::info!(
+                                                    "Peer (bg): playing file {file_id} at frame {adjusted} (comp +{comp} frames: {:.2} ms network + {:.2} ms processing)",
+                                                    latency_ns as f64 / 1_000_000.0,
+                                                    processing_ns as f64 / 1_000_000.0,
+                                                );
+                                            });
+                                        } else {
+                                            // File not in cache — stop current playback so peer
+                                            // doesn't keep playing a different song than the host.
+                                            let audio = s.audio_output.lock().await;
+                                            if let Some(ref ao) = *audio {
+                                                ao.stop();
+                                            }
+                                            *s.peer_current_file_id.lock() = None;
+                                            log::warn!("Peer: stopped playback — PlayCommand for {file_id} but file not available");
                                         }
-                                        *s.peer_current_file_id.lock() = None;
-                                        log::warn!("Peer: stopped playback — PlayCommand for {file_id} but file not available");
                                     }
                                 }
                                 Message::PauseCommand { position_samples, sample_rate: host_sr } => {
+                                    let received_at = std::time::Instant::now();
                                     let s = app_clone.state::<AppState>();
                                     stop_position_ticker(&s).await;
+                                    let latency_ns = {
+                                        let session = s.session.lock().await;
+                                        if let Session::Peer(ref peer) = *session {
+                                            peer.clock_sync.lock().current_latency_ns
+                                        } else { 0 }
+                                    };
                                     let audio = s.audio_output.lock().await;
                                     if let Some(ref ao) = *audio {
-                                        let adjusted = convert_sample_position(position_samples, host_sr, ao.device_sample_rate);
+                                        let peer_sr = ao.device_sample_rate;
+                                        let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
+                                        let processing_ns = received_at.elapsed().as_nanos() as u64;
+                                        let total_delay_ns = latency_ns + processing_ns;
+                                        let comp = latency_compensation_frames(total_delay_ns, peer_sr);
+                                        adjusted += comp;
                                         ao.seek(adjusted);
                                         ao.pause();
-                                        log::info!("Peer: paused at sample {adjusted} (host sent {position_samples} @ {host_sr} Hz)");
+                                        log::info!(
+                                            "Peer: paused at frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
+                                            latency_ns as f64 / 1_000_000.0,
+                                            processing_ns as f64 / 1_000_000.0,
+                                        );
                                     }
                                 }
                                 Message::StopCommand => {
@@ -1817,9 +1943,13 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
             }
 
             // Validate MP3 by trying to decode — keep result for pre-cached playback.
-            let decoded = match crate::audio::decoder::decode_mp3(&file_data) {
-                Ok(d) => d,
-                Err(_e) => return Err("Invalid or corrupted MP3 file.".into()),
+            let file_data_for_decode = file_data.clone();
+            let decoded = match tokio::task::spawn_blocking(move || {
+                crate::audio::decoder::decode_mp3(&file_data_for_decode)
+            }).await {
+                Ok(Ok(d)) => d,
+                Ok(Err(_e)) => return Err("Invalid or corrupted MP3 file.".into()),
+                Err(e) => return Err(format!("Decode task failed: {e}")),
             };
             let duration_secs = decoded.duration_secs;
 
@@ -1828,20 +1958,25 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
             let cached_decoded = if let Some(dev_rate) = target_rate {
                 if decoded.sample_rate != dev_rate {
                     log::info!("[add_song] Pre-resampling from {} Hz to {} Hz", decoded.sample_rate, dev_rate);
-                    let resampled = AudioOutput::resample(
-                        &decoded.samples,
-                        decoded.channels,
-                        decoded.sample_rate,
-                        dev_rate,
-                    );
-                    let new_frames = resampled.len() as u64 / decoded.channels as u64;
-                    let new_duration = new_frames as f64 / dev_rate as f64;
-                    crate::audio::decoder::DecodedAudio {
-                        samples: resampled,
-                        sample_rate: dev_rate,
-                        channels: decoded.channels,
-                        total_frames: new_frames,
-                        duration_secs: new_duration,
+                    match tokio::task::spawn_blocking(move || {
+                        let resampled = AudioOutput::resample(
+                            &decoded.samples,
+                            decoded.channels,
+                            decoded.sample_rate,
+                            dev_rate,
+                        );
+                        let new_frames = resampled.len() as u64 / decoded.channels as u64;
+                        let new_duration = new_frames as f64 / dev_rate as f64;
+                        crate::audio::decoder::DecodedAudio {
+                            samples: resampled,
+                            sample_rate: dev_rate,
+                            channels: decoded.channels,
+                            total_frames: new_frames,
+                            duration_secs: new_duration,
+                        }
+                    }).await {
+                        Ok(d) => d,
+                        Err(e) => return Err(format!("Resample task failed: {e}")),
                     }
                 } else {
                     decoded
@@ -1863,28 +1998,34 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
             state.decoded_cache.lock().await.insert(track_id, cached_decoded);
             log::info!("[add_song] Pre-cached decoded audio for {track_id}");
 
-            // Transfer the file to all connected peers.
+            // Transfer the file to all connected peers in background.
             let peer_ids: Vec<u32> = host.peers.lock().keys().copied().collect();
             log::info!("[add_song] track_id={track_id} file={file_name} size={} peers={:?}", file_data.len(), peer_ids);
+            let file_name_for_log = file_name.clone();
             if !peer_ids.is_empty() {
                 let tcp_host = host.tcp_host.clone();
-                let mut mgr = state.file_transfer_mgr.lock().await;
-                if let Err(e) = mgr.start_transfer_with_id(
-                    track_id,
-                    file_name.clone(),
-                    file_data,
-                    &peer_ids,
-                    &tcp_host,
-                ).await {
-                    log::warn!("Failed to transfer file to peers: {e}");
-                }
+                drop(session);
+                let app_for_transfer = app.clone();
+                tokio::spawn(async move {
+                    let state = app_for_transfer.state::<AppState>();
+                    let mut mgr = state.file_transfer_mgr.lock().await;
+                    if let Err(e) = mgr.start_transfer_with_id(
+                        track_id,
+                        file_name,
+                        file_data,
+                        &peer_ids,
+                        &tcp_host,
+                    ).await {
+                        log::warn!("Failed to transfer file to peers: {e}");
+                    }
+                });
+            } else {
+                drop(session);
             }
-
-            drop(session);
 
             emit_queue_update(&app, &queue_items);
 
-            log::info!("Added song \"{}\" to queue ({})", file_name, track_id);
+            log::info!("Added song \"{}\" to queue ({})", file_name_for_log, track_id);
             Ok(())
         }
         _ => Err("Only the host can add songs directly.".into()),
