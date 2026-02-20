@@ -714,6 +714,7 @@ pub async fn join_session(
                                     }
                                 }
                                 Message::PlayCommand { file_id, position_samples, sample_rate: host_sr, .. } => {
+                                    let received_at = std::time::Instant::now();
                                     log::info!("[peer] Received PlayCommand: file_id={file_id} position_samples={position_samples} host_sr={host_sr}");
                                     let s = app_clone.state::<AppState>();
 
@@ -778,17 +779,21 @@ pub async fn join_session(
                                         let peer_sr = ao.device_sample_rate;
                                         let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
 
-                                        // Compensate for network latency: skip ahead by the
-                                        // estimated one-way latency so we start at the same
-                                        // point the host is at *now* (not when it sent the command).
-                                        let comp = latency_compensation_frames(latency_ns, peer_sr);
+                                        // Compensate for network latency + local processing time.
+                                        let processing_ns = received_at.elapsed().as_nanos() as u64;
+                                        let total_delay_ns = latency_ns + processing_ns;
+                                        let comp = latency_compensation_frames(total_delay_ns, peer_sr);
                                         adjusted += comp;
 
                                         if adjusted > 0 {
                                             ao.seek(adjusted);
                                         }
                                         ao.play_at(std::time::Instant::now());
-                                        log::info!("Peer: playing file {file_id} at frame {adjusted} (latency comp +{comp} frames, {:.2} ms)", latency_ns as f64 / 1_000_000.0);
+                                        log::info!(
+                                            "Peer: playing file {file_id} at frame {adjusted} (comp +{comp} frames: {:.2} ms network + {:.2} ms processing)",
+                                            latency_ns as f64 / 1_000_000.0,
+                                            processing_ns as f64 / 1_000_000.0,
+                                        );
                                     }
                                 }
                                 Message::PauseCommand { position_samples, sample_rate: host_sr } => {
@@ -810,6 +815,7 @@ pub async fn join_session(
                                     }
                                 }
                                 Message::ResumeCommand { position_samples, sample_rate: host_sr, .. } => {
+                                    let received_at = std::time::Instant::now();
                                     let s = app_clone.state::<AppState>();
                                     let latency_ns = {
                                         let session = s.session.lock().await;
@@ -821,15 +827,22 @@ pub async fn join_session(
                                     if let Some(ref ao) = *audio {
                                         let peer_sr = ao.device_sample_rate;
                                         let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
-                                        let comp = latency_compensation_frames(latency_ns, peer_sr);
+                                        let processing_ns = received_at.elapsed().as_nanos() as u64;
+                                        let total_delay_ns = latency_ns + processing_ns;
+                                        let comp = latency_compensation_frames(total_delay_ns, peer_sr);
                                         adjusted += comp;
 
                                         ao.seek(adjusted);
                                         ao.resume_at(std::time::Instant::now());
-                                        log::info!("Peer: resumed at frame {adjusted} (latency comp +{comp}, {:.2} ms)", latency_ns as f64 / 1_000_000.0);
+                                        log::info!(
+                                            "Peer: resumed at frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
+                                            latency_ns as f64 / 1_000_000.0,
+                                            processing_ns as f64 / 1_000_000.0,
+                                        );
                                     }
                                 }
                                 Message::SeekCommand { position_samples, sample_rate: host_sr, .. } => {
+                                    let received_at = std::time::Instant::now();
                                     let s = app_clone.state::<AppState>();
                                     let latency_ns = {
                                         let session = s.session.lock().await;
@@ -841,12 +854,18 @@ pub async fn join_session(
                                     if let Some(ref ao) = *audio {
                                         let peer_sr = ao.device_sample_rate;
                                         let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
-                                        let comp = latency_compensation_frames(latency_ns, peer_sr);
+                                        let processing_ns = received_at.elapsed().as_nanos() as u64;
+                                        let total_delay_ns = latency_ns + processing_ns;
+                                        let comp = latency_compensation_frames(total_delay_ns, peer_sr);
                                         adjusted += comp;
 
                                         ao.seek(adjusted);
                                         ao.resume_at(std::time::Instant::now());
-                                        log::info!("Peer: seeked to frame {adjusted} (latency comp +{comp}, {:.2} ms)", latency_ns as f64 / 1_000_000.0);
+                                        log::info!(
+                                            "Peer: seeked to frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
+                                            latency_ns as f64 / 1_000_000.0,
+                                            processing_ns as f64 / 1_000_000.0,
+                                        );
                                     }
                                 }
                                 _ => {}
