@@ -637,18 +637,49 @@ pub async fn join_session(
                                         let received_at = std::time::Instant::now();
                                         let s = app_clone.state::<AppState>();
 
-                                        // Check current peer playback state (need audio lock).
-                                        let peer_is_playing = {
+                                        // Check current peer playback state.
+                                        let peer_state = {
                                             let audio = s.audio_output.lock().await;
                                             if let Some(ref ao) = *audio {
-                                                matches!(ao.get_state(), crate::audio::playback::PlaybackStateEnum::Playing)
+                                                ao.get_state()
                                             } else {
-                                                false
+                                                crate::audio::playback::PlaybackStateEnum::Stopped
                                             }
                                         };
 
-                                        if !peer_is_playing {
-                                            log::info!("[peer] Catch-up: host is playing but we are not — attempting to start playback for {file_id}");
+                                        use crate::audio::playback::PlaybackStateEnum;
+
+                                        if peer_state == PlaybackStateEnum::Paused {
+                                            // ── Fast path: track already loaded, just seek & resume ──
+                                            log::info!("[peer] Catch-up: peer is paused, resuming at host position for {file_id}");
+
+                                            let latency_ns = {
+                                                let session = s.session.lock().await;
+                                                if let Session::Peer(ref peer) = *session {
+                                                    peer.clock_sync.lock().current_latency_ns
+                                                } else { 0 }
+                                            };
+
+                                            let audio = s.audio_output.lock().await;
+                                            if let Some(ref ao) = *audio {
+                                                let peer_sr = ao.device_sample_rate;
+                                                let mut adjusted = convert_sample_position(position_samples, host_sr, peer_sr);
+                                                let processing_ns = received_at.elapsed().as_nanos() as u64;
+                                                let total_delay_ns = latency_ns + processing_ns;
+                                                let comp = latency_compensation_frames(total_delay_ns, peer_sr);
+                                                adjusted += comp;
+
+                                                ao.seek(adjusted);
+                                                ao.resume_at(std::time::Instant::now());
+                                                log::info!(
+                                                    "[peer] Catch-up: resumed {file_id} at frame {adjusted} (comp +{comp}: {:.2} ms network + {:.2} ms processing)",
+                                                    latency_ns as f64 / 1_000_000.0,
+                                                    processing_ns as f64 / 1_000_000.0,
+                                                );
+                                            }
+                                        } else if peer_state == PlaybackStateEnum::Stopped {
+                                            // ── Full path: need to decode and load the track ──
+                                            log::info!("[peer] Catch-up: host is playing but we are stopped — attempting to start playback for {file_id}");
 
                                             // Try pre-decoded cache first, then raw file cache.
                                             let pre_decoded = {
@@ -731,6 +762,7 @@ pub async fn join_session(
                                                 );
                                             }
                                         }
+                                        // Playing or Waiting — already in the right state, no catch-up needed.
                                     }
 
                                     // Always emit the UI event.
