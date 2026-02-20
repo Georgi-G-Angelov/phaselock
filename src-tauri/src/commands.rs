@@ -1240,7 +1240,11 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
             };
             drop(audio);
 
-            emit_playback_state(app, "playing", &file_name, 0, duration_ms);
+            let position_ms = if sr > 0 { (current_pos as u64 * 1000) / sr as u64 } else { 0 };
+            emit_playback_state(app, "playing", &file_name, position_ms, duration_ms);
+
+            // Restart the position ticker so the progress bar keeps updating.
+            start_position_ticker(app, state, duration_ms).await;
 
             // Broadcast ResumeCommand to peers with actual paused position.
             let target_time_ns = now_ns() + 50_000_000; // 50ms safety margin
