@@ -455,6 +455,48 @@ pub async fn create_session(
                                         log::info!("Peer {peer_id} already has all files");
                                     }
                                 }
+                                Message::SongRequest { file_name, file_size } => {
+                                    log::info!("[host] Received SongRequest from peer {peer_id}: \"{file_name}\" ({file_size} bytes)");
+                                    let s = app_clone.state::<AppState>();
+
+                                    // Look up peer display name.
+                                    let peer_name = {
+                                        let session = s.session.lock().await;
+                                        if let Session::Host(ref host) = *session {
+                                            host.peers.lock()
+                                                .get(&peer_id)
+                                                .map(|p| p.display_name.clone())
+                                                .unwrap_or_else(|| format!("Peer {peer_id}"))
+                                        } else {
+                                            format!("Peer {peer_id}")
+                                        }
+                                    };
+
+                                    let mut requests = s.song_requests.lock().await;
+                                    match requests.receive_request(peer_id, peer_name.clone(), file_name.clone(), file_size) {
+                                        Ok(pending) => {
+                                            #[derive(Clone, serde::Serialize)]
+                                            struct SongRequestIncoming {
+                                                request_id: String,
+                                                peer_name: String,
+                                                file_name: String,
+                                                file_size: u64,
+                                            }
+                                            let _ = app_clone.emit(
+                                                "request:incoming",
+                                                SongRequestIncoming {
+                                                    request_id: pending.request_id.to_string(),
+                                                    peer_name,
+                                                    file_name,
+                                                    file_size,
+                                                },
+                                            );
+                                        }
+                                        Err(reason) => {
+                                            log::warn!("[host] Auto-rejected song request from peer {peer_id}: {reason:?}");
+                                        }
+                                    }
+                                }
                                 _ => {
                                     // Other messages handled by session layer internally.
                                 }
