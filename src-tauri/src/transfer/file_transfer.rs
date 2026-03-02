@@ -149,6 +149,9 @@ impl FileTransferManager {
 
     /// Start transferring raw bytes with a specific file_id.
     /// Useful when the ID must match the queue track ID.
+    ///
+    /// If a transfer for this file already exists, the new peer(s) are added to
+    /// it and the file is re-sent to them (handles reconnection gracefully).
     pub async fn start_transfer_with_id(
         &mut self,
         file_id: Uuid,
@@ -166,8 +169,40 @@ impl FileTransferManager {
 
         let sha256 = compute_sha256(&file_data);
 
-        if self.active_transfers.contains_key(&file_id) {
-            return Err(TransferError::AlreadyTransferring(file_id));
+        // If this file already has an active transfer, add the new peer(s) and
+        // resend to them.  This covers the reconnection case where a peer
+        // dropped and came back but the host still has old transfer state.
+        if let Some(state) = self.active_transfers.get_mut(&file_id) {
+            let mut peers_to_send: Vec<u32> = Vec::new();
+            for &pid in peer_ids {
+                if state.peers_pending.contains(&pid) {
+                    // Already being sent to this peer — skip.
+                    continue;
+                }
+                // Move from confirmed/failed back to pending so the file is
+                // re-sent (the peer may have lost its cache).
+                state.peers_confirmed.remove(&pid);
+                state.peers_failed.remove(&pid);
+                state.retry_counts.remove(&pid);
+                state.peers_pending.insert(pid);
+                peers_to_send.push(pid);
+            }
+
+            if peers_to_send.is_empty() {
+                // All requested peers are already pending — nothing to do.
+                return Err(TransferError::AlreadyTransferring(file_id));
+            }
+
+            log::info!(
+                "Adding {} new peer(s) to existing transfer of \"{}\" ({file_id})",
+                peers_to_send.len(),
+                state.file_name,
+            );
+
+            for &pid in &peers_to_send {
+                Self::resend_to_peer(tcp_host, pid, state).await;
+            }
+            return Ok(file_id);
         }
 
         let peers_pending: HashSet<u32> = peer_ids.iter().copied().collect();
@@ -321,9 +356,29 @@ impl FileTransferManager {
     }
 
     /// Cancel a peer's part of any active transfers (e.g. on disconnect).
+    ///
+    /// Removes the peer from all tracking sets (`peers_pending`,
+    /// `peers_confirmed`, `peers_failed`) and cleans up transfers that have
+    /// no remaining peers.
     pub fn cancel_peer(&mut self, peer_id: u32) {
-        for state in self.active_transfers.values_mut() {
+        let mut empty_transfers = Vec::new();
+        for (&file_id, state) in self.active_transfers.iter_mut() {
             state.peers_pending.remove(&peer_id);
+            state.peers_confirmed.remove(&peer_id);
+            state.peers_failed.remove(&peer_id);
+            state.retry_counts.remove(&peer_id);
+
+            // If no peers remain at all, mark for cleanup.
+            if state.peers_pending.is_empty()
+                && state.peers_confirmed.is_empty()
+                && state.peers_failed.is_empty()
+            {
+                empty_transfers.push(file_id);
+            }
+        }
+        for file_id in empty_transfers {
+            log::info!("Removing empty transfer for {file_id} after peer {peer_id} disconnected");
+            self.active_transfers.remove(&file_id);
         }
     }
 

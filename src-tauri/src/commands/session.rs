@@ -101,6 +101,12 @@ pub async fn create_session(
                             let _ = app_clone.emit("session:peer-joined", PeerJoinedPayload { peer_id, display_name });
                         }
                         crate::session::SessionEvent::PeerLeft { peer_id } => {
+                            // Clear per-peer transfer tracking so retransfer works on reconnect.
+                            let s = app_clone.state::<AppState>();
+                            {
+                                let mut mgr = s.file_transfer_mgr.lock().await;
+                                mgr.cancel_peer(peer_id);
+                            }
                             let _ = app_clone.emit("session:peer-left", PeerLeftPayload { peer_id });
                         }
                         crate::session::SessionEvent::HostDisconnected => {
@@ -521,8 +527,20 @@ pub async fn join_session(
             // Forward events.
             let app_clone = app.clone();
             tokio::spawn(async move {
-                while let Some(event) = event_rx.recv().await {
-                    match event {
+                // Periodic timer for proactive file-sync: every 10 seconds the
+                // peer checks whether it has the next 5 queue items cached and,
+                // if not, sends a FileCacheReport so the host retransfers the
+                // missing files.
+                let mut file_sync_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                // Consume the first (immediate) tick so the first real check
+                // happens 10 s after joining.
+                file_sync_interval.tick().await;
+
+                loop {
+                    tokio::select! {
+                        event = event_rx.recv() => {
+                            let Some(event) = event else { break };
+                            match event {
                         crate::session::SessionEvent::PeerJoined { peer_id, display_name } => {
                             let _ = app_clone.emit("session:peer-joined", PeerJoinedPayload { peer_id, display_name });
                         }
@@ -1259,7 +1277,48 @@ pub async fn join_session(
                             }
                         }
                     }
-                }
+                    } // end event arm
+
+                    // ── Periodic file-sync arm ──────────────────────────
+                    _ = file_sync_interval.tick() => {
+                        let s = app_clone.state::<AppState>();
+                        let queue = s.queue.lock().await;
+                        let queue_items = queue.get_queue();
+                        // Look at the next 5 items (or fewer if the queue is short).
+                        let upcoming: Vec<uuid::Uuid> = queue_items.iter()
+                            .take(5)
+                            .map(|q| q.id)
+                            .collect();
+                        drop(queue);
+
+                        if upcoming.is_empty() {
+                            continue;
+                        }
+
+                        let cache = s.file_cache.lock().await;
+                        let missing: Vec<uuid::Uuid> = upcoming.iter()
+                            .filter(|id| !cache.has(id))
+                            .copied()
+                            .collect();
+                        let cached_ids = cache.cached_ids();
+                        drop(cache);
+
+                        if !missing.is_empty() {
+                            log::info!(
+                                "[peer] File-sync check: missing {} of {} upcoming file(s): {:?}",
+                                missing.len(),
+                                upcoming.len(),
+                                missing,
+                            );
+                            // Send a FileCacheReport so the host transfers the missing files.
+                            let mut session = s.session.lock().await;
+                            if let Session::Peer(ref mut peer) = &mut *session {
+                                peer.send_file_cache_report(cached_ids).await;
+                            }
+                        }
+                    }
+                    } // end select!
+                } // end loop
             });
 
             // Start the latency-logging ticker.
