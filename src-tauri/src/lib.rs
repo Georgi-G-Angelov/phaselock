@@ -63,22 +63,22 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::create_session,
-            commands::join_session,
-            commands::leave_session,
-            commands::get_discovered_sessions,
-            commands::play,
-            commands::pause,
-            commands::stop,
-            commands::seek,
-            commands::skip,
-            commands::add_song,
-            commands::remove_from_queue,
-            commands::reorder_queue,
-            commands::request_song,
-            commands::accept_song_request,
-            commands::reject_song_request,
-            commands::set_volume,
+            commands::session::create_session,
+            commands::session::join_session,
+            commands::session::leave_session,
+            commands::session::get_discovered_sessions,
+            commands::playback::play,
+            commands::playback::pause,
+            commands::playback::stop,
+            commands::playback::seek,
+            commands::playback::skip,
+            commands::queue::add_song,
+            commands::queue::remove_from_queue,
+            commands::queue::reorder_queue,
+            commands::requests::request_song,
+            commands::requests::accept_song_request,
+            commands::requests::reject_song_request,
+            commands::playback::set_volume,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PhaseLock");
