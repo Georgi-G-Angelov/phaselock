@@ -345,7 +345,7 @@ impl Drop for TcpHost {
 
 /// Peer-side TCP client: connects to a host, reads/writes framed messages.
 pub struct TcpPeer {
-    writer: Arc<tokio::sync::Mutex<Option<OwnedWriteHalf>>>,
+    pub writer: Arc<tokio::sync::Mutex<Option<OwnedWriteHalf>>>,
     _reader_handle: tokio::task::JoinHandle<()>,
     _heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,

@@ -6,7 +6,6 @@ use crate::audio::decoder::DecodedAudio;
 use crate::audio::playback::AudioOutput;
 use crate::network::mdns::DiscoveredSession;
 use crate::network::messages::{Message, QueueItem};
-use crate::session::Session;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
@@ -162,12 +161,12 @@ pub(super) async fn evict_decoded_cache(state: &AppState) {
 /// track. Called after the window shifts (play, skip, advance).
 pub(super) async fn backfill_decoded_cache(app: &AppHandle, state: &AppState) {
     // Determine which IDs are in the window but not yet in the cache.
-    let (window_ids, is_host) = {
+    // NOTE: we deliberately do NOT hold `queue` and `session` simultaneously
+    // to avoid lock-inversion deadlocks (add_song and leave_session take
+    // them in the opposite order).
+    let window_ids = {
         let queue = state.queue.lock().await;
-        let ids = queue.upcoming_ids(DECODED_CACHE_WINDOW);
-        let session = state.session.lock().await;
-        let host = matches!(&*session, Session::Host(_));
-        (ids, host)
+        queue.upcoming_ids(DECODED_CACHE_WINDOW)
     };
 
     let cached_ids: std::collections::HashSet<Uuid> = {
@@ -192,13 +191,17 @@ pub(super) async fn backfill_decoded_cache(app: &AppHandle, state: &AppState) {
     let target_rate = *state.device_sample_rate.lock();
 
     for file_id in missing {
-        // Get the raw bytes — host keeps them in track_data, peer in file_cache.
-        let raw_bytes: Option<Vec<u8>> = if is_host {
+        // Get the raw bytes — try host's track_data first, then peer's
+        // file_cache.  This avoids needing a session lock to check is_host.
+        let raw_bytes: Option<Vec<u8>> = {
             let store = state.track_data.lock().await;
             store.get(&file_id).cloned()
-        } else {
+        };
+        let raw_bytes = if raw_bytes.is_none() {
             let cache = state.file_cache.lock().await;
             cache.get(&file_id).cloned()
+        } else {
+            raw_bytes
         };
 
         let Some(bytes) = raw_bytes else {

@@ -783,12 +783,26 @@ pub async fn join_session(
                                                     // Immediately send a FileCacheReport so the host
                                                     // transfers this file instead of waiting for the
                                                     // periodic 10-second file-sync timer.
+                                                    // Clone the TCP writer Arc and drop the session
+                                                    // lock before the async send to avoid holding
+                                                    // session across an await point.
                                                     let cache = s.file_cache.lock().await;
                                                     let cached_ids = cache.cached_ids();
                                                     drop(cache);
-                                                    let mut session = s.session.lock().await;
-                                                    if let Session::Peer(ref mut peer) = &mut *session {
-                                                        peer.send_file_cache_report(cached_ids).await;
+                                                    let writer = {
+                                                        let session = s.session.lock().await;
+                                                        if let Session::Peer(ref peer) = *session {
+                                                            Some(peer.tcp_peer.writer.clone())
+                                                        } else {
+                                                            None
+                                                        }
+                                                    };
+                                                    if let Some(writer) = writer {
+                                                        let msg = Message::FileCacheReport { file_ids: cached_ids };
+                                                        let mut guard = writer.lock().await;
+                                                        if let Some(ref mut w) = *guard {
+                                                            let _ = crate::network::messages::write_message(w, &msg).await;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1351,9 +1365,22 @@ pub async fn join_session(
                                 missing,
                             );
                             // Send a FileCacheReport so the host transfers the missing files.
-                            let mut session = s.session.lock().await;
-                            if let Session::Peer(ref mut peer) = &mut *session {
-                                peer.send_file_cache_report(cached_ids).await;
+                            // Clone the TCP writer Arc and drop the session lock before
+                            // the async send to avoid holding session across an await.
+                            let writer = {
+                                let session = s.session.lock().await;
+                                if let Session::Peer(ref peer) = *session {
+                                    Some(peer.tcp_peer.writer.clone())
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(writer) = writer {
+                                let msg = Message::FileCacheReport { file_ids: cached_ids };
+                                let mut guard = writer.lock().await;
+                                if let Some(ref mut w) = *guard {
+                                    let _ = crate::network::messages::write_message(w, &msg).await;
+                                }
                             }
                         }
                     }
@@ -1422,11 +1449,17 @@ pub async fn join_session(
 #[tauri::command]
 pub async fn leave_session(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let mut session = state.session.lock().await;
 
-    if !session.is_active() {
-        return Err("No active session to leave.".into());
-    }
+    // Take the session out of the mutex so we can drop the lock before
+    // acquiring queue / track_data / etc.  This prevents lock-inversion
+    // deadlocks with backfill_decoded_cache (which takes queue → session).
+    let mut old_session = {
+        let mut session = state.session.lock().await;
+        if !session.is_active() {
+            return Err("No active session to leave.".into());
+        }
+        std::mem::replace(&mut *session, Session::None)
+    };
 
     // Stop latency ticker and audio playback.
     if let Some(h) = state.latency_ticker.lock().await.take() {
@@ -1449,7 +1482,7 @@ pub async fn leave_session(app: AppHandle) -> Result<(), String> {
     *state.host_current_track.lock() = None;
     *state.host_tcp.lock() = None;
 
-    session.shutdown().await;
+    old_session.shutdown().await;
 
     // Notify the frontend.
     let _ = app.emit("playback:state-changed", PlaybackStatePayload {

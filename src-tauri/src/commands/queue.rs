@@ -12,10 +12,25 @@ use uuid::Uuid;
 #[tauri::command]
 pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let session = state.session.lock().await;
 
-    match &*session {
-        Session::Host(host) => {
+    // Extract what we need from the session (peer list + TCP handle) and
+    // drop the lock immediately.  Holding `session` across file I/O and
+    // decode would create a lock-inversion deadlock with
+    // `backfill_decoded_cache` which takes `queue → session`.
+    let (peer_ids, tcp_host_arc) = {
+        let session = state.session.lock().await;
+        match &*session {
+            Session::Host(host) => {
+                let ids: Vec<u32> = host.peers.lock().keys().copied().collect();
+                let tcp = host.tcp_host.clone();
+                (ids, tcp)
+            }
+            _ => return Err("Only the host can add songs directly.".into()),
+        }
+    };
+
+    {
+        {
             use std::path::Path;
             let path = Path::new(&file_path);
             let file_name = path
@@ -112,13 +127,11 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
                     q.upcoming_ids(TRANSFER_WINDOW).contains(&track_id)
                 };
 
-            let peer_ids: Vec<u32> = host.peers.lock().keys().copied().collect();
             log::info!("[add_song] track_id={track_id} file={file_name} size={} peers={:?} in_window={in_window}", file_data.len(), peer_ids);
             let file_name_for_log = file_name.clone();
             if !peer_ids.is_empty() && in_window {
-                let tcp_host = host.tcp_host.clone();
-                drop(session);
                 let app_for_transfer = app.clone();
+                let tcp_host = tcp_host_arc;
                 tokio::spawn(async move {
                     let state = app_for_transfer.state::<AppState>();
                     let mut mgr = state.file_transfer_mgr.lock().await;
@@ -136,7 +149,6 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
                 if !in_window {
                     log::info!("[add_song] Track {track_id} outside transfer window, skipping peer transfer");
                 }
-                drop(session);
             }
 
             emit_queue_update(&app, &queue_items);
@@ -144,7 +156,6 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
             log::info!("Added song \"{}\" to queue ({})", file_name_for_log, track_id);
             Ok(())
         }
-        _ => Err("Only the host can add songs directly.".into()),
     }
 }
 
