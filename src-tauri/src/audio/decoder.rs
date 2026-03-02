@@ -87,57 +87,47 @@ pub fn parse_mp3_metadata(data: &[u8]) -> TrackMetadata {
     TrackMetadata { title, artist }
 }
 
-/// Resolve title and artist from ID3 metadata, falling back to filename
-/// parsing ("Artist - Title" pattern) and then to defaults.
+/// Resolve title and artist using a three-tier strategy:
+/// 1. "Artist - Title" filename pattern (most reliable for user-named files)
+/// 2. ID3 tag metadata
+/// 3. Raw filename stem / "Unknown" defaults
 pub fn resolve_track_info(metadata: &TrackMetadata, file_name: &str) -> (String, String) {
+    // Strip .mp3 extension for filename-based parsing.
+    let stem = file_name.strip_suffix(".mp3")
+        .or_else(|| file_name.strip_suffix(".MP3"))
+        .unwrap_or(file_name);
+
+    // Tier 1: "Artist - Title" filename pattern.
+    if let Some(dash_pos) = stem.find('-') {
+        let left = stem[..dash_pos].trim();
+        let right = stem[dash_pos + 1..].trim();
+        if !left.is_empty() && !right.is_empty() {
+            return (right.to_string(), left.to_string());
+        }
+    }
+
+    // Tier 2: ID3 tag metadata.
     let has_title = metadata.title.as_ref()
         .map_or(false, |t| !t.is_empty() && t.to_lowercase() != "unknown");
     let has_artist = metadata.artist.as_ref()
         .map_or(false, |a| !a.is_empty() && a.to_lowercase() != "unknown");
 
-    if has_title && has_artist {
-        return (
-            metadata.title.clone().unwrap(),
-            metadata.artist.clone().unwrap(),
-        );
+    if has_title || has_artist {
+        let title = if has_title {
+            metadata.title.clone().unwrap()
+        } else {
+            stem.to_string()
+        };
+        let artist = if has_artist {
+            metadata.artist.clone().unwrap()
+        } else {
+            "Unknown".to_string()
+        };
+        return (title, artist);
     }
 
-    // Strip .mp3 extension for filename-based fallback.
-    let stem = file_name.strip_suffix(".mp3")
-        .or_else(|| file_name.strip_suffix(".MP3"))
-        .unwrap_or(file_name);
-
-    // Try "Artist - Title" pattern.
-    if let Some(dash_pos) = stem.find('-') {
-        let left = stem[..dash_pos].trim();
-        let right = stem[dash_pos + 1..].trim();
-        if !left.is_empty() && !right.is_empty() {
-            let title = if has_title {
-                metadata.title.clone().unwrap()
-            } else {
-                right.to_string()
-            };
-            let artist = if has_artist {
-                metadata.artist.clone().unwrap()
-            } else {
-                left.to_string()
-            };
-            return (title, artist);
-        }
-    }
-
-    // Final fallback.
-    let title = if has_title {
-        metadata.title.clone().unwrap()
-    } else {
-        stem.to_string()
-    };
-    let artist = if has_artist {
-        metadata.artist.clone().unwrap()
-    } else {
-        "Unknown".to_string()
-    };
-    (title, artist)
+    // Tier 3: Raw filename stem / defaults.
+    (stem.to_string(), "Unknown".to_string())
 }
 
 // ── DecodedAudio ────────────────────────────────────────────────────────────
