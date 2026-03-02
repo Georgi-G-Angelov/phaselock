@@ -190,7 +190,7 @@
                     </span>
 
                     <!-- Track info -->
-                    <div class="flex-col flex-1" style="min-width: 0;">
+                    <div class="flex-col flex-1" style="min-width: 0; overflow: hidden;">
                         <span class="text-ellipsis track-title">{item.title}</span>
                         <span class="text-xs text-secondary text-ellipsis">
                             {item.artist} · {formatDuration(item.duration_secs)}
@@ -237,6 +237,7 @@
     .queue-item {
         border-radius: var(--radius-sm);
         transition: background var(--transition-fast);
+        width: 100%;
     }
 
     .queue-item:hover {

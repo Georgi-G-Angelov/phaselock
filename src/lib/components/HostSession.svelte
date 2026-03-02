@@ -138,7 +138,7 @@
     }
 
     .panel-right {
-        width: 300px;
+        width: 380px;
         flex-shrink: 0;
         border-left: 1px solid var(--border-subtle);
     }
