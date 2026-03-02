@@ -751,8 +751,56 @@ pub async fn join_session(
                                                     log::warn!("[peer] Catch-up: file {file_id} not in cache yet (still transferring?)");
                                                 }
                                             }
+                                        } else if same_file && (peer_state == PlaybackStateEnum::Playing || peer_state == PlaybackStateEnum::Waiting) {
+                                            // ── Drift correction: peer is playing the same file, check if out of sync ──
+                                            let s = app_clone.state::<AppState>();
+
+                                            let latency_ns = {
+                                                let session = s.session.lock().await;
+                                                if let Session::Peer(ref peer) = *session {
+                                                    peer.clock_sync.lock().current_latency_ns
+                                                } else { 0 }
+                                            };
+
+                                            let audio = s.audio_output.lock().await;
+                                            if let Some(ref ao) = *audio {
+                                                let peer_sr = ao.device_sample_rate;
+                                                let peer_pos_frames = ao.get_position();
+
+                                                // Compute expected position: host position converted
+                                                // to peer sample rate, plus latency & processing compensation.
+                                                let processing_ns = received_at.elapsed().as_nanos() as u64;
+                                                let total_delay_ns = latency_ns + processing_ns;
+                                                let expected_frames = convert_sample_position(position_samples, host_sr, peer_sr)
+                                                    + latency_compensation_frames(total_delay_ns, peer_sr);
+
+                                                // Compute drift in milliseconds.
+                                                let drift_frames = expected_frames as i64 - peer_pos_frames as i64;
+                                                let drift_ms = if peer_sr > 0 {
+                                                    drift_frames as f64 / peer_sr as f64 * 1000.0
+                                                } else {
+                                                    0.0
+                                                };
+
+                                                const DRIFT_THRESHOLD_MS: f64 = 50.0;
+
+                                                if drift_ms.abs() > DRIFT_THRESHOLD_MS {
+                                                    log::info!(
+                                                        "[peer] Drift correction: {:.1} ms off (expected frame {expected_frames}, actual {peer_pos_frames}) — seeking to correct (latency {:.2} ms + processing {:.2} ms)",
+                                                        drift_ms,
+                                                        latency_ns as f64 / 1_000_000.0,
+                                                        processing_ns as f64 / 1_000_000.0,
+                                                    );
+                                                    ao.seek(expected_frames);
+                                                } else {
+                                                    log::debug!(
+                                                        "[peer] Drift check: {:.1} ms — within threshold, no correction needed",
+                                                        drift_ms
+                                                    );
+                                                }
+                                            }
                                         }
-                                        // else: Playing/Waiting the same file — already in the right state.
+                                        // else: other states — no action needed.
                                     }
 
                                     // Always emit the UI event.
