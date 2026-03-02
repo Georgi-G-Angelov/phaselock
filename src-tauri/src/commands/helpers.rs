@@ -115,6 +115,12 @@ pub(super) fn broadcast_to_peers(app: &AppHandle, msg: &Message) {
 /// Maximum number of decoded tracks to keep in memory (playing + next N).
 pub(super) const DECODED_CACHE_WINDOW: usize = 5;
 
+/// Maximum number of tracks (from the current position) the host will
+/// proactively transfer to peers.  Keeps the network from being saturated
+/// when a peer joins a large queue.  The peer's periodic file-sync timer
+/// will request more files as it advances through the queue.
+pub(super) const TRANSFER_WINDOW: usize = 5;
+
 /// Check whether a track id falls within the current decoded-cache window.
 ///
 /// Returns `true` when the track is among the currently playing track and

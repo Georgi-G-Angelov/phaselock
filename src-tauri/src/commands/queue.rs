@@ -101,11 +101,21 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
                 log::info!("[add_song] Track {track_id} outside cache window, skipping pre-cache");
             }
 
-            // Transfer the file to all connected peers in background.
+            // Transfer the file to all connected peers, but only if the
+            // newly added track falls within the upcoming transfer window.
+            // Peers will request files past the window via their periodic
+            // file-sync timer as the queue advances.
+            use super::helpers::TRANSFER_WINDOW;
+            let in_window = is_in_cache_window(&state, track_id).await
+                || {
+                    let q = state.queue.lock().await;
+                    q.upcoming_ids(TRANSFER_WINDOW).contains(&track_id)
+                };
+
             let peer_ids: Vec<u32> = host.peers.lock().keys().copied().collect();
-            log::info!("[add_song] track_id={track_id} file={file_name} size={} peers={:?}", file_data.len(), peer_ids);
+            log::info!("[add_song] track_id={track_id} file={file_name} size={} peers={:?} in_window={in_window}", file_data.len(), peer_ids);
             let file_name_for_log = file_name.clone();
-            if !peer_ids.is_empty() {
+            if !peer_ids.is_empty() && in_window {
                 let tcp_host = host.tcp_host.clone();
                 drop(session);
                 let app_for_transfer = app.clone();
@@ -123,6 +133,9 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
                     }
                 });
             } else {
+                if !in_window {
+                    log::info!("[add_song] Track {track_id} outside transfer window, skipping peer transfer");
+                }
                 drop(session);
             }
 

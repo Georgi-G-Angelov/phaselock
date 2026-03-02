@@ -119,16 +119,19 @@ pub async fn create_session(
                             match message {
                                 Message::FileCacheReport { file_ids } => {
                                     // Peer told us what files it already has.
-                                    // Transfer any queued tracks the peer is missing.
+                                    // Only transfer the next TRANSFER_WINDOW files the peer is missing
+                                    // to avoid saturating the network with bulk transfers.
+                                    use super::helpers::TRANSFER_WINDOW;
                                     log::info!("[host] Received FileCacheReport from peer {peer_id} with {} cached file(s)", file_ids.len());
                                     let s = app_clone.state::<AppState>();
                                     let queue = s.queue.lock().await;
-                                    let all_track_ids: Vec<Uuid> = queue.get_queue().iter().map(|q| q.id).collect();
-                                    log::info!("[host] Queue has {} track(s): {:?}", all_track_ids.len(), all_track_ids);
+                                    let upcoming_ids: Vec<Uuid> = queue.upcoming_ids(TRANSFER_WINDOW)
+                                        .into_iter().collect();
+                                    log::info!("[host] Queue has {} track(s), upcoming window: {:?}", queue.get_queue().len(), upcoming_ids);
                                     drop(queue);
 
                                     let cached_set: std::collections::HashSet<Uuid> = file_ids.into_iter().collect();
-                                    let missing: Vec<Uuid> = all_track_ids.into_iter()
+                                    let missing: Vec<Uuid> = upcoming_ids.into_iter()
                                         .filter(|id| !cached_set.contains(id))
                                         .collect();
 
@@ -315,30 +318,40 @@ pub async fn create_session(
                                                     log::info!("[host] Uploaded track {track_id} outside cache window, skipping pre-cache");
                                                 }
 
-                                                // Transfer the file to other peers (exclude the uploader — they already have it).
-                                                let tcp_host = s.host_tcp.lock().clone();
-                                                if let Some(tcp_host) = tcp_host {
-                                                    let session = s.session.lock().await;
-                                                    if let Session::Host(ref host) = *session {
-                                                        let other_peer_ids: Vec<u32> = host.peers.lock()
-                                                            .keys()
-                                                            .copied()
-                                                            .filter(|&id| id != peer_id)
-                                                            .collect();
-                                                        drop(session);
-                                                        if !other_peer_ids.is_empty() {
-                                                            let mut mgr = s.file_transfer_mgr.lock().await;
-                                                            if let Err(e) = mgr.start_transfer_with_id(
-                                                                track_id,
-                                                                file_name.clone(),
-                                                                file_data,
-                                                                &other_peer_ids,
-                                                                &tcp_host,
-                                                            ).await {
-                                                                log::warn!("[host] Failed to transfer uploaded file to peers: {e}");
+                                                // Transfer the file to other peers (exclude the uploader),
+                                                // but only if the track falls within the transfer window.
+                                                let in_transfer_window = {
+                                                    let q = s.queue.lock().await;
+                                                    q.upcoming_ids(super::helpers::TRANSFER_WINDOW).contains(&track_id)
+                                                };
+
+                                                if in_transfer_window {
+                                                    let tcp_host = s.host_tcp.lock().clone();
+                                                    if let Some(tcp_host) = tcp_host {
+                                                        let session = s.session.lock().await;
+                                                        if let Session::Host(ref host) = *session {
+                                                            let other_peer_ids: Vec<u32> = host.peers.lock()
+                                                                .keys()
+                                                                .copied()
+                                                                .filter(|&id| id != peer_id)
+                                                                .collect();
+                                                            drop(session);
+                                                            if !other_peer_ids.is_empty() {
+                                                                let mut mgr = s.file_transfer_mgr.lock().await;
+                                                                if let Err(e) = mgr.start_transfer_with_id(
+                                                                    track_id,
+                                                                    file_name.clone(),
+                                                                    file_data,
+                                                                    &other_peer_ids,
+                                                                    &tcp_host,
+                                                                ).await {
+                                                                    log::warn!("[host] Failed to transfer uploaded file to peers: {e}");
+                                                                }
                                                             }
                                                         }
                                                     }
+                                                } else {
+                                                    log::info!("[host] Uploaded track {track_id} outside transfer window, skipping peer relay");
                                                 }
 
                                                 emit_queue_update(&app_for_upload, &queue_items);
@@ -771,7 +784,26 @@ pub async fn join_session(
                                             }
                                         } else if same_file && (peer_state == PlaybackStateEnum::Playing || peer_state == PlaybackStateEnum::Waiting) {
                                             // ── Drift correction: peer is playing the same file, check if out of sync ──
+                                            // Skip drift correction while files are still transferring — the
+                                            // network congestion makes latency measurements unreliable.
                                             let s = app_clone.state::<AppState>();
+                                            {
+                                                let receiver = s.file_receiver.lock().await;
+                                                if receiver.active_incoming_count() > 0 {
+                                                    log::debug!("[peer] Skipping drift correction — {} file(s) still transferring", receiver.active_incoming_count());
+                                                    // Still emit the UI event below.
+                                                    let _ = app_clone.emit(
+                                                        "playback:state-changed",
+                                                        PlaybackStatePayload {
+                                                            state,
+                                                            file_name,
+                                                            position_ms,
+                                                            duration_ms,
+                                                        },
+                                                    );
+                                                    continue;
+                                                }
+                                            }
 
                                             let latency_ns = {
                                                 let session = s.session.lock().await;
@@ -1281,14 +1313,12 @@ pub async fn join_session(
 
                     // ── Periodic file-sync arm ──────────────────────────
                     _ = file_sync_interval.tick() => {
+                        use super::helpers::TRANSFER_WINDOW;
                         let s = app_clone.state::<AppState>();
                         let queue = s.queue.lock().await;
-                        let queue_items = queue.get_queue();
-                        // Look at the next 5 items (or fewer if the queue is short).
-                        let upcoming: Vec<uuid::Uuid> = queue_items.iter()
-                            .take(5)
-                            .map(|q| q.id)
-                            .collect();
+                        // Use the same window the host uses, based on queue position.
+                        let upcoming: Vec<uuid::Uuid> = queue.upcoming_ids(TRANSFER_WINDOW)
+                            .into_iter().collect();
                         drop(queue);
 
                         if upcoming.is_empty() {

@@ -396,6 +396,14 @@ impl FileTransferManager {
     pub fn remove_transfer(&mut self, file_id: Uuid) {
         self.active_transfers.remove(&file_id);
     }
+
+    /// Number of active outgoing transfers (files with at least one pending peer).
+    pub fn active_transfer_count(&self) -> usize {
+        self.active_transfers
+            .values()
+            .filter(|s| !s.peers_pending.is_empty())
+            .count()
+    }
 }
 
 impl Default for FileTransferManager {
@@ -559,6 +567,11 @@ impl FileReceiver {
     /// Remove a completed file from memory (e.g. when no longer needed).
     pub fn remove_file(&mut self, file_id: Uuid) {
         self.completed_files.remove(&file_id);
+    }
+
+    /// Number of files currently being received (chunks still incoming).
+    pub fn active_incoming_count(&self) -> usize {
+        self.incoming.len()
     }
 }
 
