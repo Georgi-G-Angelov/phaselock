@@ -53,18 +53,30 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
             drop(audio);
 
             let position_ms = if sr > 0 { (current_pos as u64 * 1000) / sr as u64 } else { 0 };
-            emit_playback_state(app, "playing", &file_name, position_ms, duration_ms);
 
-            // Restart the position ticker so the progress bar keeps updating.
-            start_position_ticker(app, state, duration_ms).await;
+            // Update host_current_track BEFORE emitting, so the
+            // PlaybackStateUpdate broadcast carries the correct position.
+            {
+                let mut ct = state.host_current_track.lock();
+                if let Some(ref mut track) = *ct {
+                    track.position_samples = current_pos;
+                    track.is_playing = true;
+                }
+            }
 
-            // Broadcast ResumeCommand to peers with actual paused position.
+            // Broadcast ResumeCommand to peers FIRST so it arrives
+            // before the PlaybackStateUpdate that emit_playback_state sends.
             let target_time_ns = now_ns() + 50_000_000; // 50ms safety margin
             broadcast_to_peers(app, &Message::ResumeCommand {
                 position_samples: current_pos,
                 target_time_ns,
                 sample_rate: sr,
             });
+
+            emit_playback_state(app, "playing", &file_name, position_ms, duration_ms);
+
+            // Restart the position ticker so the progress bar keeps updating.
+            start_position_ticker(app, state, duration_ms).await;
 
             return Ok(());
         }
@@ -233,11 +245,12 @@ pub async fn pause(app: AppHandle) -> Result<(), String> {
                 },
             });
 
-            // Update shared current track state.
+            // Update shared current track state with paused position.
             {
                 let mut ct = state.host_current_track.lock();
                 if let Some(ref mut track) = *ct {
                     track.is_playing = false;
+                    track.position_samples = pos_samples;
                 }
             }
 
