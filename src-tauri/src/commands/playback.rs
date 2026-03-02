@@ -372,6 +372,87 @@ pub async fn skip(app: AppHandle) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+pub async fn back(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let session = state.session.lock().await;
+
+    match &*session {
+        Session::Host(_host) => {
+            drop(session);
+
+            // Check how long the current song has been playing.
+            let position_ms = {
+                let audio = state.audio_output.lock().await;
+                if let Some(ref ao) = *audio {
+                    let pos = ao.get_position() as u64;
+                    let sr = ao.playback_state().sample_rate.load(std::sync::atomic::Ordering::Acquire) as u64;
+                    if sr > 0 { (pos * 1000) / sr } else { 0 }
+                } else {
+                    0
+                }
+            };
+
+            if position_ms >= 5000 {
+                // Restart current track — seek to 0.
+                let audio = state.audio_output.lock().await;
+                if let Some(ref ao) = *audio {
+                    ao.seek(0);
+                }
+                drop(audio);
+
+                let queue = state.queue.lock().await;
+                let (file_name, duration_ms) = queue.current()
+                    .map(|t| (t.file_name.clone(), (t.duration_secs * 1000.0) as u64))
+                    .unwrap_or_default();
+                drop(queue);
+
+                emit_playback_state(&app, "playing", &file_name, 0, duration_ms);
+
+                // Broadcast seek-to-start to peers.
+                let sr = {
+                    let audio = state.audio_output.lock().await;
+                    audio.as_ref().map(|ao| ao.playback_state().sample_rate.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(44100)
+                };
+                let target_time_ns = now_ns() + 50_000_000;
+                broadcast_to_peers(&app, &Message::SeekCommand {
+                    position_samples: 0,
+                    target_time_ns,
+                    sample_rate: sr,
+                });
+
+                log::info!("Back: restarted current track (was at {} ms)", position_ms);
+            } else {
+                // Go to previous track.
+                stop_position_ticker(&state).await;
+                let audio = state.audio_output.lock().await;
+                if let Some(ref ao) = *audio {
+                    ao.stop();
+                }
+                drop(audio);
+
+                let mut queue = state.queue.lock().await;
+                let has_prev = queue.previous().is_some();
+                let queue_items = queue.get_queue();
+                drop(queue);
+
+                emit_queue_update(&app, &queue_items);
+
+                if has_prev {
+                    log::info!("Back: went to previous track");
+                    play_current_track(&app, &state).await?;
+                } else {
+                    // Already at the start — just restart current track.
+                    log::info!("Back: already at first track, restarting");
+                    play_current_track(&app, &state).await?;
+                }
+            }
+            Ok(())
+        }
+        _ => Err("Only the host can control playback.".into()),
+    }
+}
+
 // ── Local Controls ──────────────────────────────────────────────────────────
 
 #[tauri::command]

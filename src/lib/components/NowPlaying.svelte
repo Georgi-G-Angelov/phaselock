@@ -49,8 +49,8 @@
         }
     }
 
-    async function handleStop() {
-        try { await invoke('stop'); } catch (e) { dispatch('toast-message', { message: `${e}`, variant: 'error' }); }
+    async function handleBack() {
+        try { await invoke('back'); } catch (e) { dispatch('toast-message', { message: `${e}`, variant: 'error' }); }
     }
 
     async function handleSkip() {
@@ -90,10 +90,10 @@
         <div class="transport-controls flex-center gap-3">
             <button
                 class="btn-icon"
-                aria-label="Stop"
-                on:click={handleStop}
+                aria-label="Back"
+                on:click={handleBack}
                 disabled={!hasTrack}
-            >⏹</button>
+            >⏮</button>
 
             <button
                 class="btn-icon large"

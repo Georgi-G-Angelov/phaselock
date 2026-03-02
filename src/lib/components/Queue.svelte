@@ -5,12 +5,19 @@
     import Spinner from './Spinner.svelte';
 
     import { createEventDispatcher } from 'svelte';
+    import type { QueueItem } from '../types';
 
     /** Whether the queue is editable (host only). */
     export let editable: boolean = false;
 
     /** Whether to show the Request Song button (peer only). */
     export let showRequestButton: boolean = false;
+
+    // Filter out played songs but remember each item's real backend index.
+    type VisibleItem = { item: QueueItem; realIndex: number };
+    $: visibleQueue = $queueStore
+        .map((item, i) => ({ item, realIndex: i }))
+        .filter(({ item }) => item.status !== 'Played') as VisibleItem[];
 
     const dispatch = createEventDispatcher<{ 'toast-message': { message: string; variant: 'success' | 'error' | 'info' } }>();
 
@@ -42,6 +49,7 @@
 
     let dragIndex: number | null = null;
     let dropIndex: number | null = null;
+    let dragRealIndex: number | null = null;
 
     async function addSong() {
         const selected = await open({
@@ -68,8 +76,9 @@
         }
     }
 
-    function handleDragStart(e: DragEvent, i: number) {
+    function handleDragStart(e: DragEvent, i: number, realIdx: number) {
         dragIndex = i;
+        dragRealIndex = realIdx;
         if (e.dataTransfer) {
             e.dataTransfer.effectAllowed = 'move';
             e.dataTransfer.setData('text/plain', String(i));
@@ -88,22 +97,24 @@
         dropIndex = null;
     }
 
-    async function handleDrop(e: DragEvent, toIndex: number) {
+    async function handleDrop(e: DragEvent, toIndex: number, toRealIndex: number) {
         e.preventDefault();
-        if (dragIndex !== null && dragIndex !== toIndex) {
+        if (dragRealIndex !== null && dragRealIndex !== toRealIndex) {
             try {
-                await invoke('reorder_queue', { fromIndex: dragIndex, toIndex });
+                await invoke('reorder_queue', { fromIndex: dragRealIndex, toIndex: toRealIndex });
             } catch (err) {
                 console.error('Failed to reorder queue:', err);
             }
         }
         dragIndex = null;
         dropIndex = null;
+        dragRealIndex = null;
     }
 
     function handleDragEnd() {
         dragIndex = null;
         dropIndex = null;
+        dragRealIndex = null;
     }
 
     function formatDuration(secs: number): string {
@@ -117,14 +128,14 @@
     <div class="flex items-center justify-between">
         <h4>Queue</h4>
         <div class="flex items-center gap-2">
-            <span class="text-sm text-secondary">{$queueStore.length} tracks</span>
+            <span class="text-sm text-secondary">{visibleQueue.length} tracks</span>
             {#if editable}
                 <button class="btn btn-primary btn-sm" on:click={addSong}>+ Add Song</button>
             {/if}
         </div>
     </div>
 
-    {#if $queueStore.length === 0}
+    {#if visibleQueue.length === 0}
         <div class="empty-queue flex-center flex-col gap-2 p-4">
             <p class="text-secondary text-sm">Queue is empty.</p>
             {#if editable}
@@ -138,25 +149,24 @@
             on:dragover|preventDefault
             on:drop|preventDefault
         >
-            {#each $queueStore as item, i (item.id)}
+            {#each visibleQueue as { item, realIndex }, i (item.id)}
                 <div
                     class="queue-item flex items-center gap-2 p-2"
                     class:is-playing={item.status === 'Playing'}
                     class:is-dragging={dragIndex === i}
                     class:drop-target={dropIndex === i}
                     draggable={editable ? 'true' : 'false'}
-                    on:dragstart={(e) => handleDragStart(e, i)}
+                    on:dragstart={(e) => handleDragStart(e, i, realIndex)}
                     on:dragover={(e) => handleDragOver(e, i)}
                     on:dragleave={handleDragLeave}
-                    on:drop={(e) => handleDrop(e, i)}
+                    on:drop={(e) => handleDrop(e, i, realIndex)}
                     on:dragend={handleDragEnd}
                     role={editable ? 'listitem' : undefined}
                 >
-                    <!-- Drag handle / index -->
+                    <!-- Drag handle -->
                     {#if editable}
                         <span class="drag-handle text-xs text-secondary" aria-label="Drag to reorder">⠿</span>
                     {/if}
-                    <span class="queue-index text-xs text-secondary">{i + 1}</span>
 
                     <!-- Status indicator -->
                     <span class="status-indicator flex-shrink-0">
@@ -166,8 +176,6 @@
                             <span class="status-ready">✓</span>
                         {:else if item.status === 'Playing'}
                             <span class="status-playing">♪</span>
-                        {:else}
-                            <span class="status-played text-secondary">✓</span>
                         {/if}
                     </span>
 
@@ -241,12 +249,6 @@
         border-top: 2px solid var(--accent-green);
     }
 
-    .queue-index {
-        width: 1.25rem;
-        text-align: center;
-        flex-shrink: 0;
-    }
-
     .drag-handle {
         cursor: grab;
         opacity: 0.4;
@@ -274,11 +276,6 @@
         color: var(--accent-green);
         font-size: 0.875rem;
         animation: pulse 1s ease-in-out infinite;
-    }
-
-    .status-played {
-        font-size: 0.75rem;
-        opacity: 0.5;
     }
 
     .remove-btn {

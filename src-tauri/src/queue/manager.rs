@@ -276,6 +276,35 @@ impl QueueManager {
     pub fn skip(&mut self) -> Option<&QueueItem> {
         self.advance()
     }
+
+    /// Go back to the previous track.
+    ///
+    /// Marks the current track as `Ready` and moves `current_index` back
+    /// by one. The previous track is also marked `Ready` (it was `Played`).
+    /// Returns `Some(&QueueItem)` if a previous track exists and is now
+    /// ready, or `None` if already at the start (or queue is empty).
+    pub fn previous(&mut self) -> Option<&QueueItem> {
+        let ci = self.current_index?;
+        if ci == 0 {
+            return None;
+        }
+
+        // Mark current track back to Ready.
+        if let Some(item) = self.queue.get_mut(ci) {
+            item.status = QueueItemStatus::Ready;
+        }
+
+        let prev = ci - 1;
+        // Mark previous track as Ready (it was Played).
+        if let Some(item) = self.queue.get_mut(prev) {
+            item.status = QueueItemStatus::Ready;
+        }
+
+        self.current_index = Some(prev);
+        let item = &self.queue[prev];
+        log::info!("Queue: went back to track {} (index {})", item.id, prev);
+        Some(item)
+    }
 }
 
 impl Default for QueueManager {
