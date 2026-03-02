@@ -13,6 +13,26 @@
     $: isPlaying = $playbackStore.state === 'playing';
     $: isPaused = $playbackStore.state === 'paused';
     $: console.log('[NowPlaying] playbackStore updated:', $playbackStore, 'hasTrack:', hasTrack);
+
+    /** Resolve display title & artist from queue metadata, falling back to filename parsing. */
+    function resolveNowPlaying(fileName: string): { title: string; artist: string } {
+        // Try to find the Playing item in the queue.
+        const playing = $queueStore.find(q => q.status === 'Playing');
+        if (playing && playing.title && playing.artist) {
+            return { title: playing.title, artist: playing.artist };
+        }
+        // Fallback: "Artist - Title" filename pattern.
+        const stem = fileName.replace(/\.mp3$/i, '');
+        const dash = stem.indexOf('-');
+        if (dash !== -1) {
+            const left = stem.slice(0, dash).trim();
+            const right = stem.slice(dash + 1).trim();
+            if (left && right) return { title: right, artist: left };
+        }
+        return { title: stem || fileName, artist: 'Unknown' };
+    }
+
+    $: nowPlaying = resolveNowPlaying($playbackStore.file_name);
     $: progress = $playbackStore.duration_ms > 0
         ? ($playbackStore.position_ms / $playbackStore.duration_ms) * 100
         : 0;
@@ -62,8 +82,9 @@
     <h4>Now Playing</h4>
 
     {#if hasTrack}
-        <div class="track-info flex-col gap-1">
-            <span class="track-name text-ellipsis">{$playbackStore.file_name}</span>
+        <div class="track-info flex-col">
+            <span class="track-title text-ellipsis">{nowPlaying.title}</span>
+            <span class="track-artist text-ellipsis">{nowPlaying.artist}</span>
         </div>
 
         <!-- Progress bar -->
@@ -116,9 +137,16 @@
 </div>
 
 <style>
-    .track-name {
+    .track-title {
         font-size: 1.125rem;
         font-weight: 600;
+        line-height: 1.3;
+    }
+
+    .track-artist {
+        font-size: 0.8rem;
+        color: var(--text-secondary);
+        line-height: 1.3;
     }
 
     .progress-bar {
