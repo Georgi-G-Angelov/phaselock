@@ -66,9 +66,17 @@ pub async fn add_song(app: AppHandle, file_path: String) -> Result<(), String> {
             };
             let duration_secs = decoded.duration_secs;
 
+            // Parse ID3 metadata for title/artist.
+            let file_data_for_meta = file_data.clone();
+            let metadata = tokio::task::spawn_blocking(move || {
+                crate::audio::decoder::parse_mp3_metadata(&file_data_for_meta)
+            }).await.unwrap_or_default();
+            let (title, artist) = crate::audio::decoder::resolve_track_info(&metadata, &file_name);
+            log::info!("[add_song] Metadata: title=\"{title}\" artist=\"{artist}\"");
+
             // Add to queue first so we can check if it's in the cache window.
             let mut queue = state.queue.lock().await;
-            let track_id = queue.add(file_name.clone(), duration_secs, "host".into());
+            let track_id = queue.add(file_name.clone(), title, artist, duration_secs, "host".into());
             queue.mark_ready(track_id);
             let queue_items = queue.get_queue();
             drop(queue);

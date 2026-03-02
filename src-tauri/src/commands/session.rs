@@ -260,11 +260,19 @@ pub async fn create_session(
                                                 };
                                                 let duration_secs = decoded.duration_secs;
 
+                                                // Parse ID3 metadata for title/artist.
+                                                let file_data_for_meta = file_data.clone();
+                                                let metadata = tokio::task::spawn_blocking(move || {
+                                                    crate::audio::decoder::parse_mp3_metadata(&file_data_for_meta)
+                                                }).await.unwrap_or_default();
+                                                let (title, artist) = crate::audio::decoder::resolve_track_info(&metadata, &file_name);
+                                                log::info!("[host] Upload metadata: title=\"{title}\" artist=\"{artist}\"");
+
                                                 // Add to queue first (before cache decision) so
                                                 // we can check whether this track is in the window.
                                                 let track_id = request_id;
                                                 let mut queue = s.queue.lock().await;
-                                                queue.add_with_id(track_id, file_name.clone(), duration_secs, format!("peer {peer_id}"));
+                                                queue.add_with_id(track_id, file_name.clone(), title, artist, duration_secs, format!("peer {peer_id}"));
                                                 queue.mark_ready(track_id);
                                                 let queue_items = queue.get_queue();
                                                 drop(queue);

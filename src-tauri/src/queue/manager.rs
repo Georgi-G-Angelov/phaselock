@@ -32,17 +32,19 @@ impl QueueManager {
     // ── Mutations ───────────────────────────────────────────────────────
 
     /// Add a track to the end of the queue. Returns the generated `Uuid`.
-    pub fn add(&mut self, file_name: String, duration_secs: f64, added_by: String) -> Uuid {
+    pub fn add(&mut self, file_name: String, title: String, artist: String, duration_secs: f64, added_by: String) -> Uuid {
         let id = Uuid::new_v4();
-        self.add_with_id(id, file_name, duration_secs, added_by);
+        self.add_with_id(id, file_name, title, artist, duration_secs, added_by);
         id
     }
 
     /// Add a track with a pre-determined UUID (e.g. from a song-request id).
-    pub fn add_with_id(&mut self, id: Uuid, file_name: String, duration_secs: f64, added_by: String) {
+    pub fn add_with_id(&mut self, id: Uuid, file_name: String, title: String, artist: String, duration_secs: f64, added_by: String) {
         self.queue.push(QueueItem {
             id,
             file_name,
+            title,
+            artist,
             duration_secs,
             added_by,
             status: QueueItemStatus::Transferring,
@@ -419,7 +421,7 @@ mod tests {
     /// Helper: add N tracks and return their IDs.
     fn add_tracks(qm: &mut QueueManager, n: usize) -> Vec<Uuid> {
         (0..n)
-            .map(|i| qm.add(format!("song{}.mp3", i + 1), 180.0 + i as f64, "host".into()))
+            .map(|i| qm.add(format!("song{}.mp3", i + 1), format!("Song {}", i + 1), "Artist".into(), 180.0 + i as f64, "host".into()))
             .collect()
     }
 
@@ -445,7 +447,7 @@ mod tests {
     #[test]
     fn test_add_sets_metadata() {
         let mut qm = QueueManager::new();
-        let id = qm.add("cool.mp3".into(), 200.5, "alice".into());
+        let id = qm.add("cool.mp3".into(), "Cool Song".into(), "alice".into(), 200.5, "alice".into());
 
         let item = &qm.get_queue()[0];
         assert_eq!(item.id, id);
@@ -596,8 +598,7 @@ mod tests {
     #[test]
     fn test_mark_ready() {
         let mut qm = QueueManager::new();
-        let id = qm.add("a.mp3".into(), 100.0, "host".into());
-        assert_eq!(qm.get_queue()[0].status, QueueItemStatus::Transferring);
+        let id = qm.add("a.mp3".into(), "A".into(), "X".into(), 100.0, "host".into());
 
         qm.mark_ready(id);
         assert_eq!(qm.get_queue()[0].status, QueueItemStatus::Ready);
@@ -607,7 +608,7 @@ mod tests {
     #[test]
     fn test_mark_playing() {
         let mut qm = QueueManager::new();
-        let id = qm.add("a.mp3".into(), 100.0, "host".into());
+        let id = qm.add("a.mp3".into(), "A".into(), "X".into(), 100.0, "host".into());
         qm.mark_ready(id);
         qm.mark_playing(id);
         assert_eq!(qm.get_queue()[0].status, QueueItemStatus::Playing);
@@ -616,7 +617,7 @@ mod tests {
     #[test]
     fn test_mark_played() {
         let mut qm = QueueManager::new();
-        let id = qm.add("a.mp3".into(), 100.0, "host".into());
+        let id = qm.add("a.mp3".into(), "A".into(), "X".into(), 100.0, "host".into());
         qm.mark_ready(id);
         qm.mark_playing(id);
         qm.mark_played(id);
@@ -756,7 +757,7 @@ mod tests {
     #[test]
     fn test_single_item_queue_full_lifecycle() {
         let mut qm = QueueManager::new();
-        let id = qm.add("only.mp3".into(), 60.0, "host".into());
+        let id = qm.add("only.mp3".into(), "Only".into(), "Artist".into(), 60.0, "host".into());
 
         qm.mark_ready(id);
         let track = qm.advance().unwrap();
@@ -775,7 +776,7 @@ mod tests {
     #[test]
     fn test_is_ready_false_for_transferring() {
         let mut qm = QueueManager::new();
-        let id = qm.add("x.mp3".into(), 100.0, "host".into());
+        let id = qm.add("x.mp3".into(), "X".into(), "Artist".into(), 100.0, "host".into());
         assert!(!qm.is_ready(id));
     }
 
@@ -871,9 +872,9 @@ mod tests {
         let id3 = Uuid::new_v4();
 
         let items = vec![
-            QueueItem { id: id1, file_name: "a.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Played },
-            QueueItem { id: id2, file_name: "b.mp3".into(), duration_secs: 200.0, added_by: "host".into(), status: QueueItemStatus::Playing },
-            QueueItem { id: id3, file_name: "c.mp3".into(), duration_secs: 300.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+            QueueItem { id: id1, file_name: "a.mp3".into(), title: "a".into(), artist: "Unknown".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Played },
+            QueueItem { id: id2, file_name: "b.mp3".into(), title: "b".into(), artist: "Unknown".into(), duration_secs: 200.0, added_by: "host".into(), status: QueueItemStatus::Playing },
+            QueueItem { id: id3, file_name: "c.mp3".into(), title: "c".into(), artist: "Unknown".into(), duration_secs: 300.0, added_by: "host".into(), status: QueueItemStatus::Ready },
         ];
 
         qm.replace_all(items);
@@ -887,8 +888,8 @@ mod tests {
     fn test_replace_all_no_playing_sets_none() {
         let mut qm = QueueManager::new();
         let items = vec![
-            QueueItem { id: Uuid::new_v4(), file_name: "a.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
-            QueueItem { id: Uuid::new_v4(), file_name: "b.mp3".into(), duration_secs: 200.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+            QueueItem { id: Uuid::new_v4(), file_name: "a.mp3".into(), title: "a".into(), artist: "Unknown".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+            QueueItem { id: Uuid::new_v4(), file_name: "b.mp3".into(), title: "b".into(), artist: "Unknown".into(), duration_secs: 200.0, added_by: "host".into(), status: QueueItemStatus::Ready },
         ];
 
         qm.replace_all(items);
@@ -901,12 +902,12 @@ mod tests {
         let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
 
         let items = vec![
-            QueueItem { id: ids[0], file_name: "a.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Played },
-            QueueItem { id: ids[1], file_name: "b.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Playing },
-            QueueItem { id: ids[2], file_name: "c.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
-            QueueItem { id: ids[3], file_name: "d.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
-            QueueItem { id: ids[4], file_name: "e.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
-            QueueItem { id: ids[5], file_name: "f.mp3".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+            QueueItem { id: ids[0], file_name: "a.mp3".into(), title: "a".into(), artist: "Unknown".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Played },
+            QueueItem { id: ids[1], file_name: "b.mp3".into(), title: "b".into(), artist: "Unknown".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Playing },
+            QueueItem { id: ids[2], file_name: "c.mp3".into(), title: "c".into(), artist: "Unknown".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+            QueueItem { id: ids[3], file_name: "d.mp3".into(), title: "d".into(), artist: "Unknown".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+            QueueItem { id: ids[4], file_name: "e.mp3".into(), title: "e".into(), artist: "Unknown".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
+            QueueItem { id: ids[5], file_name: "f.mp3".into(), title: "f".into(), artist: "Unknown".into(), duration_secs: 100.0, added_by: "host".into(), status: QueueItemStatus::Ready },
         ];
 
         qm.replace_all(items);

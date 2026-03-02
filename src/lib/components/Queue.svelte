@@ -191,9 +191,9 @@
 
                     <!-- Track info -->
                     <div class="flex-col flex-1" style="min-width: 0;">
-                        <span class="text-ellipsis text-sm">{item.file_name}</span>
-                        <span class="text-xs text-secondary">
-                            {formatDuration(item.duration_secs)} · {item.added_by}
+                        <span class="text-ellipsis track-title">{item.title}</span>
+                        <span class="text-xs text-secondary text-ellipsis">
+                            {item.artist} · {formatDuration(item.duration_secs)}
                         </span>
                     </div>
 
@@ -247,8 +247,13 @@
         background: var(--bg-elevated);
     }
 
-    .queue-item.is-playing .text-ellipsis {
+    .queue-item.is-playing .track-title {
         color: var(--accent-green);
+    }
+
+    .track-title {
+        font-size: 0.875rem;
+        font-weight: 500;
     }
 
     .queue-item.is-dragging {

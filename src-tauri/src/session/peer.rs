@@ -645,6 +645,8 @@ mod tests {
                 q.push(QueueItem {
                     id: track_id,
                     file_name: "song.mp3".into(),
+                    title: "song".into(),
+                    artist: "Unknown".into(),
                     duration_secs: 180.0,
                     added_by: "Host".into(),
                     status: QueueItemStatus::Playing,
@@ -753,6 +755,8 @@ mod tests {
                 q.push(QueueItem {
                     id: track_id,
                     file_name: "ballad.mp3".into(),
+                    title: "ballad".into(),
+                    artist: "Unknown".into(),
                     duration_secs: 240.0,
                     added_by: "Host".into(),
                     status: QueueItemStatus::Playing,
@@ -823,6 +827,8 @@ mod tests {
                 q.push(QueueItem {
                     id: id1,
                     file_name: "track1.mp3".into(),
+                    title: "track1".into(),
+                    artist: "Unknown".into(),
                     duration_secs: 200.0,
                     added_by: "Host".into(),
                     status: QueueItemStatus::Played,
@@ -830,6 +836,8 @@ mod tests {
                 q.push(QueueItem {
                     id: id2,
                     file_name: "track2.mp3".into(),
+                    title: "track2".into(),
+                    artist: "Unknown".into(),
                     duration_secs: 180.0,
                     added_by: "Host".into(),
                     status: QueueItemStatus::Playing,
@@ -837,6 +845,8 @@ mod tests {
                 q.push(QueueItem {
                     id: id3,
                     file_name: "track3.mp3".into(),
+                    title: "track3".into(),
+                    artist: "Unknown".into(),
                     duration_secs: 210.0,
                     added_by: "Alice".into(),
                     status: QueueItemStatus::Ready,

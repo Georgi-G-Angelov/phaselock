@@ -9,6 +9,8 @@ export interface PeerInfo {
 export interface QueueItem {
   id: string;
   file_name: string;
+  title: string;
+  artist: string;
   duration_secs: number;
   added_by: string;
   status: 'Transferring' | 'Ready' | 'Playing' | 'Played';

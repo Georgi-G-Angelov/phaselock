@@ -91,6 +91,8 @@ pub struct PeerInfo {
 pub struct QueueItem {
     pub id: Uuid,
     pub file_name: String,
+    pub title: String,
+    pub artist: String,
     pub duration_secs: f64,
     pub added_by: String,
     pub status: QueueItemStatus,
@@ -393,6 +395,8 @@ mod tests {
                 QueueItem {
                     id: Uuid::new_v4(),
                     file_name: "track1.mp3".into(),
+                    title: "Track 1".into(),
+                    artist: "Alice".into(),
                     duration_secs: 210.5,
                     added_by: "Alice".into(),
                     status: QueueItemStatus::Ready,
@@ -400,6 +404,8 @@ mod tests {
                 QueueItem {
                     id: Uuid::new_v4(),
                     file_name: "track2.mp3".into(),
+                    title: "Track 2".into(),
+                    artist: "Bob".into(),
                     duration_secs: 180.0,
                     added_by: "Bob".into(),
                     status: QueueItemStatus::Transferring,
@@ -545,6 +551,8 @@ mod tests {
             let item = QueueItem {
                 id: Uuid::new_v4(),
                 file_name: "test.mp3".into(),
+                title: "Test".into(),
+                artist: "Unknown".into(),
                 duration_secs: 0.0,
                 added_by: String::new(),
                 status,

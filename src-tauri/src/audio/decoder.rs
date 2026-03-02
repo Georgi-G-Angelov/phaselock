@@ -4,8 +4,141 @@ use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
+use symphonia::core::meta::{MetadataOptions, StandardTagKey};
 use symphonia::core::probe::Hint;
+
+// ── Track Metadata ──────────────────────────────────────────────────────────
+
+/// Metadata extracted from an MP3 file's ID3 tags.
+#[derive(Debug, Clone, Default)]
+pub struct TrackMetadata {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+}
+
+/// Extract ID3 metadata (title, artist) from MP3 bytes.
+///
+/// Returns whatever tags are found; missing tags are `None`.
+pub fn parse_mp3_metadata(data: &[u8]) -> TrackMetadata {
+    let cursor = Cursor::new(data.to_vec());
+    let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
+
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+
+    let mut probed = match symphonia::default::get_probe().format(
+        &hint,
+        mss,
+        &FormatOptions::default(),
+        &MetadataOptions::default(),
+    ) {
+        Ok(p) => p,
+        Err(_) => return TrackMetadata::default(),
+    };
+
+    let mut title: Option<String> = None;
+    let mut artist: Option<String> = None;
+
+    // Check metadata attached to the probe result.
+    if let Some(md) = probed.metadata.get() {
+        if let Some(rev) = md.current() {
+            for tag in rev.tags() {
+                if let Some(std_key) = tag.std_key {
+                    match std_key {
+                        StandardTagKey::TrackTitle => {
+                            let v = tag.value.to_string();
+                            if !v.is_empty() { title = Some(v); }
+                        }
+                        StandardTagKey::Artist | StandardTagKey::AlbumArtist => {
+                            if artist.is_none() {
+                                let v = tag.value.to_string();
+                                if !v.is_empty() { artist = Some(v); }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Also check metadata on the format reader (some files store it there).
+    let mut format = probed.format;
+    if title.is_none() || artist.is_none() {
+        if let Some(md) = format.metadata().current() {
+            for tag in md.tags() {
+                if let Some(std_key) = tag.std_key {
+                    match std_key {
+                        StandardTagKey::TrackTitle if title.is_none() => {
+                            let v = tag.value.to_string();
+                            if !v.is_empty() { title = Some(v); }
+                        }
+                        StandardTagKey::Artist | StandardTagKey::AlbumArtist if artist.is_none() => {
+                            let v = tag.value.to_string();
+                            if !v.is_empty() { artist = Some(v); }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    TrackMetadata { title, artist }
+}
+
+/// Resolve title and artist from ID3 metadata, falling back to filename
+/// parsing ("Artist - Title" pattern) and then to defaults.
+pub fn resolve_track_info(metadata: &TrackMetadata, file_name: &str) -> (String, String) {
+    let has_title = metadata.title.as_ref()
+        .map_or(false, |t| !t.is_empty() && t.to_lowercase() != "unknown");
+    let has_artist = metadata.artist.as_ref()
+        .map_or(false, |a| !a.is_empty() && a.to_lowercase() != "unknown");
+
+    if has_title && has_artist {
+        return (
+            metadata.title.clone().unwrap(),
+            metadata.artist.clone().unwrap(),
+        );
+    }
+
+    // Strip .mp3 extension for filename-based fallback.
+    let stem = file_name.strip_suffix(".mp3")
+        .or_else(|| file_name.strip_suffix(".MP3"))
+        .unwrap_or(file_name);
+
+    // Try "Artist - Title" pattern.
+    if let Some(dash_pos) = stem.find('-') {
+        let left = stem[..dash_pos].trim();
+        let right = stem[dash_pos + 1..].trim();
+        if !left.is_empty() && !right.is_empty() {
+            let title = if has_title {
+                metadata.title.clone().unwrap()
+            } else {
+                right.to_string()
+            };
+            let artist = if has_artist {
+                metadata.artist.clone().unwrap()
+            } else {
+                left.to_string()
+            };
+            return (title, artist);
+        }
+    }
+
+    // Final fallback.
+    let title = if has_title {
+        metadata.title.clone().unwrap()
+    } else {
+        stem.to_string()
+    };
+    let artist = if has_artist {
+        metadata.artist.clone().unwrap()
+    } else {
+        "Unknown".to_string()
+    };
+    (title, artist)
+}
 
 // ── DecodedAudio ────────────────────────────────────────────────────────────
 
