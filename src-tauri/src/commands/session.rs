@@ -779,7 +779,17 @@ pub async fn join_session(
                                                         );
                                                     });
                                                 } else {
-                                                    log::warn!("[peer] Catch-up: file {file_id} not in cache yet (still transferring?)");
+                                                    log::warn!("[peer] Catch-up: file {file_id} not in cache yet — requesting from host");
+                                                    // Immediately send a FileCacheReport so the host
+                                                    // transfers this file instead of waiting for the
+                                                    // periodic 10-second file-sync timer.
+                                                    let cache = s.file_cache.lock().await;
+                                                    let cached_ids = cache.cached_ids();
+                                                    drop(cache);
+                                                    let mut session = s.session.lock().await;
+                                                    if let Session::Peer(ref mut peer) = &mut *session {
+                                                        peer.send_file_cache_report(cached_ids).await;
+                                                    }
                                                 }
                                             }
                                         } else if same_file && (peer_state == PlaybackStateEnum::Playing || peer_state == PlaybackStateEnum::Waiting) {

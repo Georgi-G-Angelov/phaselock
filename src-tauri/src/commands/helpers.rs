@@ -73,25 +73,26 @@ pub(super) fn emit_playback_state(app: &AppHandle, pstate: &str, file_name: &str
     );
 
     // Broadcast to peers over TCP with full playback info for catch-up.
+    // Read file_name AND file_id from the same atomic snapshot of
+    // `host_current_track` to avoid mismatches during rapid skipping.
     let state = app.state::<AppState>();
     let tcp_host = state.host_tcp.lock().clone();
     if let Some(tcp_host) = tcp_host {
         let ct = state.host_current_track.lock().clone();
-        let (file_id, position_samples, sample_rate) = ct
-            .map(|t| (t.file_id, t.position_samples, t.sample_rate))
-            .unwrap_or((Uuid::nil(), 0, 0));
-        let msg = Message::PlaybackStateUpdate {
-            state: pstate.to_string(),
-            file_name: file_name.to_string(),
-            position_ms,
-            duration_ms,
-            file_id,
-            position_samples,
-            sample_rate,
-        };
-        tokio::spawn(async move {
-            tcp_host.broadcast(&msg).await;
-        });
+        if let Some(track) = ct {
+            let msg = Message::PlaybackStateUpdate {
+                state: pstate.to_string(),
+                file_name: track.file_name.clone(),
+                position_ms,
+                duration_ms,
+                file_id: track.file_id,
+                position_samples: track.position_samples,
+                sample_rate: track.sample_rate,
+            };
+            tokio::spawn(async move {
+                tcp_host.broadcast(&msg).await;
+            });
+        }
     }
 }
 
