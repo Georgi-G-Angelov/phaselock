@@ -117,6 +117,15 @@
         dragRealIndex = null;
     }
 
+    async function handleDoubleClick(trackId: string) {
+        if (!editable) return;
+        try {
+            await invoke('play_track', { trackId });
+        } catch (e) {
+            console.error('Failed to play track:', e);
+        }
+    }
+
     function formatDuration(secs: number): string {
         const m = Math.floor(secs / 60);
         const s = Math.floor(secs % 60);
@@ -161,6 +170,7 @@
                     on:dragleave={handleDragLeave}
                     on:drop={(e) => handleDrop(e, i, realIndex)}
                     on:dragend={handleDragEnd}
+                    on:dblclick={() => handleDoubleClick(item.id)}
                     role={editable ? 'listitem' : undefined}
                 >
                     <!-- Drag handle -->

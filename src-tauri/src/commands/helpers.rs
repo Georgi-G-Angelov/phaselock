@@ -112,6 +112,42 @@ pub(super) fn broadcast_to_peers(app: &AppHandle, msg: &Message) {
 
 // ── Decoded-audio cache helpers ─────────────────────────────────────────────
 
+/// Maximum number of played songs to keep in the queue for "go back".
+const MAX_PLAYED_KEPT: usize = 5;
+
+/// Prune old played tracks from the queue and free associated data.
+///
+/// Keeps the last `MAX_PLAYED_KEPT` played songs so the user can still
+/// go back, but removes anything older to limit memory usage.
+pub(super) async fn prune_old_tracks(state: &AppState) {
+    let pruned_ids = {
+        let mut queue = state.queue.lock().await;
+        queue.prune_played(MAX_PLAYED_KEPT)
+    };
+
+    if pruned_ids.is_empty() {
+        return;
+    }
+
+    // Free track data (raw MP3 bytes).
+    {
+        let mut store = state.track_data.lock().await;
+        for id in &pruned_ids {
+            store.remove(id);
+        }
+    }
+
+    // Free decoded audio cache entries.
+    {
+        let mut dc = state.decoded_cache.lock().await;
+        for id in &pruned_ids {
+            dc.remove(id);
+        }
+    }
+
+    log::info!("[prune] Freed data for {} old track(s)", pruned_ids.len());
+}
+
 /// Maximum number of decoded tracks to keep in memory (playing + next N).
 pub(super) const DECODED_CACHE_WINDOW: usize = 5;
 

@@ -73,6 +73,7 @@ pub fn run() {
             commands::playback::seek,
             commands::playback::skip,
             commands::playback::back,
+            commands::playback::play_track,
             commands::queue::add_song,
             commands::queue::remove_from_queue,
             commands::queue::reorder_queue,

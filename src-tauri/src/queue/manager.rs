@@ -213,6 +213,51 @@ impl QueueManager {
 
     // ── Playback progression ────────────────────────────────────────────
 
+    /// Jump directly to a specific track by UUID.
+    ///
+    /// Marks the current track (if any) as `Played`, sets `current_index`
+    /// to the target track, and returns it if its status is `Ready`.
+    /// Returns `None` if the track is not found or not ready.
+    pub fn jump_to(&mut self, id: Uuid) -> Option<&QueueItem> {
+        let target_idx = self.queue.iter().position(|q| q.id == id)?;
+
+        // Mark current track as Played.
+        if let Some(ci) = self.current_index {
+            if let Some(item) = self.queue.get_mut(ci) {
+                if item.status == QueueItemStatus::Playing {
+                    item.status = QueueItemStatus::Played;
+                }
+            }
+        }
+
+        // Also mark any tracks between old position and target as Played
+        // (if jumping forward).
+        if let Some(ci) = self.current_index {
+            if target_idx > ci {
+                for i in ci..target_idx {
+                    if let Some(item) = self.queue.get_mut(i) {
+                        if item.status == QueueItemStatus::Ready || item.status == QueueItemStatus::Playing {
+                            item.status = QueueItemStatus::Played;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.current_index = Some(target_idx);
+        let item = &self.queue[target_idx];
+        if item.status == QueueItemStatus::Ready {
+            log::info!("Queue: jumped to track {} (index {})", item.id, target_idx);
+            Some(item)
+        } else {
+            log::info!(
+                "Queue: jumped to index {} but track {} is {:?}",
+                target_idx, item.id, item.status
+            );
+            None
+        }
+    }
+
     /// Advance to the next track.
     ///
     /// If the current track is set, marks it `Played` and moves to the next.
@@ -304,6 +349,58 @@ impl QueueManager {
         let item = &self.queue[prev];
         log::info!("Queue: went back to track {} (index {})", item.id, prev);
         Some(item)
+    }
+
+    /// Remove played songs that exceed `max_kept` from the front of the queue.
+    ///
+    /// Keeps the most recent `max_kept` played songs (immediately before the
+    /// current track) and removes any older ones. Returns the UUIDs of the
+    /// removed tracks so the caller can free associated data (track_data,
+    /// decoded_cache, etc.).
+    pub fn prune_played(&mut self, max_kept: usize) -> Vec<Uuid> {
+        let ci = match self.current_index {
+            Some(ci) => ci,
+            None => return Vec::new(),
+        };
+
+        // Count consecutive Played items at the front up to ci.
+        let played_count = self.queue[..ci]
+            .iter()
+            .filter(|q| q.status == QueueItemStatus::Played)
+            .count();
+
+        if played_count <= max_kept {
+            return Vec::new();
+        }
+
+        let to_remove = played_count - max_kept;
+        let mut removed_ids = Vec::with_capacity(to_remove);
+        let mut removed = 0;
+
+        // Remove `to_remove` Played items from the front, collecting their IDs.
+        self.queue.retain(|item| {
+            if removed < to_remove && item.status == QueueItemStatus::Played {
+                removed_ids.push(item.id);
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+
+        // Adjust current_index since we removed items before it.
+        self.current_index = Some(ci - removed_ids.len());
+
+        if !removed_ids.is_empty() {
+            log::info!(
+                "Queue: pruned {} old played track(s), keeping {} (total={})",
+                removed_ids.len(),
+                max_kept,
+                self.queue.len(),
+            );
+        }
+
+        removed_ids
     }
 }
 

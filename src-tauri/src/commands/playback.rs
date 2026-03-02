@@ -1,6 +1,6 @@
 use super::helpers::{
     backfill_decoded_cache, broadcast_to_peers, emit_error, emit_playback_state,
-    emit_queue_update, evict_decoded_cache,
+    emit_queue_update, evict_decoded_cache, prune_old_tracks,
 };
 use super::{AppState, PlaybackPositionPayload};
 use crate::audio::playback::AudioOutput;
@@ -108,6 +108,9 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
     let queue_items = queue.get_queue();
     drop(queue);
     emit_queue_update(app, &queue_items);
+
+    // Prune old played tracks to limit memory.
+    prune_old_tracks(state).await;
 
     // Get the raw file bytes.
     let track_store = state.track_data.lock().await;
@@ -459,6 +462,46 @@ pub async fn back(app: AppHandle) -> Result<(), String> {
                     log::info!("Back: already at first track, restarting");
                     play_current_track(&app, &state).await?;
                 }
+            }
+            Ok(())
+        }
+        _ => Err("Only the host can control playback.".into()),
+    }
+}
+
+#[tauri::command]
+pub async fn play_track(app: AppHandle, track_id: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let session = state.session.lock().await;
+
+    match &*session {
+        Session::Host(_host) => {
+            drop(session);
+
+            let id = uuid::Uuid::parse_str(&track_id)
+                .map_err(|e| format!("Invalid track ID: {e}"))?;
+
+            // Stop current playback.
+            stop_position_ticker(&state).await;
+            let audio = state.audio_output.lock().await;
+            if let Some(ref ao) = *audio {
+                ao.stop();
+            }
+            drop(audio);
+
+            // Jump to the target track.
+            let mut queue = state.queue.lock().await;
+            let found = queue.jump_to(id).is_some();
+            let queue_items = queue.get_queue();
+            drop(queue);
+
+            emit_queue_update(&app, &queue_items);
+
+            if found {
+                log::info!("Playing selected track {track_id}");
+                play_current_track(&app, &state).await?;
+            } else {
+                return Err("Track not found or not ready.".into());
             }
             Ok(())
         }
