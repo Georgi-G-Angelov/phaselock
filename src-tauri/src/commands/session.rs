@@ -569,9 +569,20 @@ pub async fn join_session(
                             let _ = app_clone.emit("session:peer-left", PeerLeftPayload { peer_id });
                         }
                         crate::session::SessionEvent::HostDisconnected => {
+                            // Stop audio playback before tearing down the session.
+                            let s = app_clone.state::<AppState>();
+                            stop_position_ticker(&s).await;
+                            {
+                                let audio = s.audio_output.lock().await;
+                                if let Some(ref ao) = *audio {
+                                    ao.stop();
+                                    log::info!("Peer: stopped audio (host disconnected)");
+                                }
+                            }
+                            *s.peer_current_file_id.lock() = None;
+
                             let _ = app_clone.emit("session:host-disconnected", ());
                             // Auto-leave when host disconnects.
-                            let s = app_clone.state::<AppState>();
                             let mut sess = s.session.lock().await;
                             *sess = Session::None;
                         }
