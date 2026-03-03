@@ -77,6 +77,7 @@ pub fn run() {
             commands::queue::add_song,
             commands::queue::remove_from_queue,
             commands::queue::reorder_queue,
+            commands::queue::shuffle_queue,
             commands::requests::request_song,
             commands::requests::accept_song_request,
             commands::requests::reject_song_request,

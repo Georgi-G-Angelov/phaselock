@@ -99,6 +99,7 @@
 
     async function handleDrop(e: DragEvent, toIndex: number, toRealIndex: number) {
         e.preventDefault();
+        e.stopPropagation();
         if (dragRealIndex !== null && dragRealIndex !== toRealIndex) {
             try {
                 await invoke('reorder_queue', { fromIndex: dragRealIndex, toIndex: toRealIndex });
@@ -117,6 +118,24 @@
         dragRealIndex = null;
     }
 
+    /** Drop on the container (empty space below items) → move to end of visible list. */
+    async function handleContainerDrop(e: DragEvent) {
+        e.preventDefault();
+        if (dragRealIndex === null || visibleQueue.length === 0) {
+            handleDragEnd();
+            return;
+        }
+        const last = visibleQueue[visibleQueue.length - 1];
+        if (dragRealIndex !== last.realIndex) {
+            try {
+                await invoke('reorder_queue', { fromIndex: dragRealIndex, toIndex: last.realIndex });
+            } catch (err) {
+                console.error('Failed to reorder queue:', err);
+            }
+        }
+        handleDragEnd();
+    }
+
     async function handleDoubleClick(trackId: string) {
         if (!editable) return;
         try {
@@ -131,6 +150,14 @@
         const s = Math.floor(secs % 60);
         return `${m}:${String(s).padStart(2, '0')}`;
     }
+
+    async function shuffleQueue() {
+        try {
+            await invoke('shuffle_queue');
+        } catch (e) {
+            console.error('Failed to shuffle queue:', e);
+        }
+    }
 </script>
 
 <div class="queue-panel card flex-col gap-3 h-full">
@@ -139,6 +166,7 @@
         <div class="flex items-center gap-2">
             <span class="text-sm text-secondary">{visibleQueue.length} tracks</span>
             {#if editable}
+                <button class="btn-icon shuffle-btn" on:click={shuffleQueue} title="Shuffle upcoming">⇄</button>
                 <button class="btn btn-primary btn-sm" on:click={addSong}>+ Add Song</button>
             {/if}
         </div>
@@ -156,7 +184,7 @@
             class="queue-list flex-col gap-1 overflow-y-auto"
             role="list"
             on:dragover|preventDefault
-            on:drop|preventDefault
+            on:drop={handleContainerDrop}
         >
             {#each visibleQueue as { item, realIndex }, i (item.id)}
                 <div
@@ -225,6 +253,21 @@
 </div>
 
 <style>
+    .shuffle-btn {
+        color: white;
+        font-size: 1rem;
+        padding: 0;
+        background: none;
+        border: none;
+        cursor: pointer;
+        opacity: 0.7;
+        transition: opacity var(--transition-fast);
+    }
+
+    .shuffle-btn:hover {
+        opacity: 1;
+    }
+
     .btn-sm {
         padding: 0.375rem 0.75rem;
         font-size: 0.75rem;

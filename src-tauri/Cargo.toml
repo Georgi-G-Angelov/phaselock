@@ -13,7 +13,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
+tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +28,7 @@ log = { version = "0.4", features = ["std"] }
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"
+rand = "0.8"
 dirs = "6"
 
 [dev-dependencies]

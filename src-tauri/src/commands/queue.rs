@@ -221,3 +221,27 @@ pub async fn reorder_queue(app: AppHandle, from_index: usize, to_index: usize) -
     log::info!("Reordered queue: {} → {}", from_index, to_index);
     Ok(())
 }
+
+#[tauri::command]
+pub async fn shuffle_queue(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let session = state.session.lock().await;
+
+    if !matches!(&*session, Session::Host(_)) {
+        return Err("Only the host can shuffle the queue.".into());
+    }
+    drop(session);
+
+    let mut queue = state.queue.lock().await;
+    queue.shuffle_upcoming();
+    let queue_items = queue.get_queue();
+    drop(queue);
+
+    evict_decoded_cache(&state).await;
+    backfill_decoded_cache(&app, &state).await;
+
+    emit_queue_update(&app, &queue_items);
+
+    log::info!("Shuffled upcoming queue");
+    Ok(())
+}

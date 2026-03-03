@@ -2711,6 +2711,7 @@ dependencies = [
  "log",
  "mdns-sd",
  "parking_lot",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "sha2",

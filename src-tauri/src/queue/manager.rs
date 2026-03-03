@@ -1,4 +1,5 @@
 use crate::network::messages::{QueueItem, QueueItemStatus};
+use rand::seq::SliceRandom;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -351,6 +352,23 @@ impl QueueManager {
         let item = &self.queue[prev];
         log::info!("Queue: went back to track {} (index {})", item.id, prev);
         Some(item)
+    }
+
+    /// Shuffle all items after the currently playing track.
+    ///
+    /// Returns `true` if there were items to shuffle, `false` otherwise.
+    pub fn shuffle_upcoming(&mut self) -> bool {
+        let start = match self.current_index {
+            Some(ci) => ci + 1,
+            None => 0,
+        };
+        if start >= self.queue.len() {
+            return false;
+        }
+        let mut rng = rand::thread_rng();
+        self.queue[start..].shuffle(&mut rng);
+        log::info!("Queue: shuffled {} upcoming tracks", self.queue.len() - start);
+        true
     }
 
     /// Remove played songs that exceed `max_kept` from the front of the queue.
