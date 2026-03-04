@@ -87,6 +87,19 @@ export interface SyncState {
   message: string;
 }
 
+export interface DownloadTask {
+  id: number;
+  url: string;
+  title: string;
+  artist: string;
+  status: 'searching' | 'pending' | 'fetchingMeta' | 'queued' | 'downloading' | 'failed';
+  error: string | null;
+}
+
+export interface DownloadQueuePayload {
+  tasks: DownloadTask[];
+}
+
 // ── Tauri event name constants ──────────────────────────────────────────────
 
 export const EVENTS = {
@@ -123,4 +136,7 @@ export const EVENTS = {
 
   // Error
   ERROR_GENERAL: 'error:general',
+
+  // YouTube download queue
+  YOUTUBE_DOWNLOAD_QUEUE: 'youtube:download-queue',
 } as const;

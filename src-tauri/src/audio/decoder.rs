@@ -185,13 +185,25 @@ impl From<SymphoniaError> for DecodeError {
 
 /// Decode an MP3 file from raw bytes into interleaved f32 PCM samples.
 pub fn decode_mp3(data: &[u8]) -> Result<DecodedAudio, DecodeError> {
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+    decode_audio_inner(data, Some(hint))
+}
+
+/// Decode any symphonia-supported audio format from raw bytes into interleaved
+/// f32 PCM samples.  Useful for YouTube downloads which may be M4A, OGG, etc.
+pub fn decode_audio(data: &[u8]) -> Result<DecodedAudio, DecodeError> {
+    decode_audio_inner(data, None)
+}
+
+/// Shared decoding implementation.
+fn decode_audio_inner(data: &[u8], hint: Option<Hint>) -> Result<DecodedAudio, DecodeError> {
     // Build a MediaSourceStream from an in-memory cursor.
     let cursor = Cursor::new(data.to_vec());
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
 
     // Probe the format.
-    let mut hint = Hint::new();
-    hint.with_extension("mp3");
+    let hint = hint.unwrap_or_default();
 
     let probed = symphonia::default::get_probe()
         .format(

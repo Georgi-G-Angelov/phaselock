@@ -132,7 +132,7 @@ async fn play_current_track(app: &AppHandle, state: &AppState) -> Result<(), Str
         // Fall back to decoding on a blocking thread.
         log::info!("[host] No pre-decoded audio for {track_id}, decoding {} bytes...", file_bytes.len());
         tokio::task::spawn_blocking(move || {
-            crate::audio::decoder::decode_mp3(&file_bytes)
+            crate::audio::decoder::decode_audio(&file_bytes)
         })
         .await
         .map_err(|e| format!("Decode task failed: {e}"))?

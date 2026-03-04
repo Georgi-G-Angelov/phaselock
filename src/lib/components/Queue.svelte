@@ -158,6 +158,94 @@
             console.error('Failed to shuffle queue:', e);
         }
     }
+
+    // ── Add Song source picker ──────────────────────────────────────────
+    let showAddMenu = false;
+    let showYoutubeInput = false;
+    let youtubeUrl = '';
+    let youtubeLoading = false;
+    let youtubeStatus = '';
+    let showSpotifyInput = false;
+    let spotifyUrl = '';
+    let spotifyLoading = false;
+    let spotifyStatus = '';
+
+    function toggleAddMenu() {
+        showAddMenu = !showAddMenu;
+    }
+
+    function pickFiles() {
+        showAddMenu = false;
+        addSong();
+    }
+
+    function openYoutubeInput() {
+        showAddMenu = false;
+        showYoutubeInput = true;
+        youtubeUrl = '';
+        youtubeStatus = '';
+    }
+
+    function closeYoutubeInput() {
+        if (!youtubeLoading) {
+            showYoutubeInput = false;
+            youtubeUrl = '';
+            youtubeStatus = '';
+        }
+    }
+
+    function openSpotifyInput() {
+        showAddMenu = false;
+        showSpotifyInput = true;
+        spotifyUrl = '';
+        spotifyStatus = '';
+    }
+
+    function closeSpotifyInput() {
+        if (!spotifyLoading) {
+            showSpotifyInput = false;
+            spotifyUrl = '';
+            spotifyStatus = '';
+        }
+    }
+
+    async function submitSpotifyUrl() {
+        const url = spotifyUrl.trim();
+        if (!url) return;
+        spotifyLoading = true;
+        spotifyStatus = 'Fetching from Spotify...';
+        try {
+            const count = await invoke<number>('import_spotify', { url });
+            spotifyStatus = '';
+            showSpotifyInput = false;
+            spotifyUrl = '';
+            dispatch('toast-message', {
+                message: `Importing ${count} track${count !== 1 ? 's' : ''} from Spotify`,
+                variant: 'success' as const,
+            });
+        } catch (e) {
+            spotifyStatus = `Error: ${e}`;
+        } finally {
+            spotifyLoading = false;
+        }
+    }
+
+    async function submitYoutubeUrl() {
+        const url = youtubeUrl.trim();
+        if (!url) return;
+        youtubeLoading = true;
+        youtubeStatus = 'Fetching info...';
+        try {
+            await invoke('enqueue_youtube', { url });
+            youtubeStatus = '';
+            showYoutubeInput = false;
+            youtubeUrl = '';
+        } catch (e) {
+            youtubeStatus = `Error: ${e}`;
+        } finally {
+            youtubeLoading = false;
+        }
+    }
 </script>
 
 <div class="queue-panel card flex-col gap-3 h-full">
@@ -167,7 +255,16 @@
             <span class="text-sm text-secondary">{visibleQueue.length} tracks</span>
             {#if editable}
                 <button class="btn-icon shuffle-btn" on:click={shuffleQueue} title="Shuffle upcoming">⇄</button>
-                <button class="btn btn-primary btn-sm" on:click={addSong}>+ Add Song</button>
+                <div class="add-menu-wrapper">
+                    <button class="btn btn-primary btn-sm" on:click={toggleAddMenu}>+ Add Song</button>
+                    {#if showAddMenu}
+                        <div class="add-menu">
+                            <button class="add-menu-item" on:click={pickFiles}>📁 Files</button>
+                            <button class="add-menu-item" on:click={openYoutubeInput}>▶ YouTube</button>
+                            <button class="add-menu-item" on:click={openSpotifyInput}>🎧 Spotify</button>
+                        </div>
+                    {/if}
+                </div>
             {/if}
         </div>
     </div>
@@ -252,7 +349,143 @@
     {/if}
 </div>
 
+<!-- YouTube URL input overlay -->
+{#if showYoutubeInput}
+    <div class="yt-overlay" on:click={closeYoutubeInput} role="presentation">
+        <div class="yt-modal card flex-col gap-4 p-6" on:click|stopPropagation role="presentation">
+            <h3>Add from YouTube</h3>
+            <p class="text-sm text-secondary">Paste a YouTube link below to download and add it to the queue.</p>
+            <input
+                class="yt-input"
+                type="text"
+                placeholder="https://www.youtube.com/watch?v=..."
+                bind:value={youtubeUrl}
+                disabled={youtubeLoading}
+                on:keydown={(e) => e.key === 'Enter' && submitYoutubeUrl()}
+            />
+            {#if youtubeStatus}
+                <p class="text-sm {youtubeStatus.startsWith('Error') ? 'text-error' : 'text-secondary'}">
+                    {#if youtubeLoading}<Spinner size={14} />{/if}
+                    {youtubeStatus}
+                </p>
+            {/if}
+            <div class="flex gap-2 justify-end">
+                <button class="btn btn-secondary" on:click={closeYoutubeInput} disabled={youtubeLoading}>Cancel</button>
+                <button class="btn btn-primary" on:click={submitYoutubeUrl} disabled={youtubeLoading || !youtubeUrl.trim()}>
+                    {youtubeLoading ? 'Adding...' : 'Add'}
+                </button>
+            </div>
+        </div>
+    </div>
+{/if}
+
+<!-- Spotify URL input overlay -->
+{#if showSpotifyInput}
+    <div class="yt-overlay" on:click={closeSpotifyInput} role="presentation">
+        <div class="yt-modal card flex-col gap-4 p-6" on:click|stopPropagation role="presentation">
+            <h3>Add from Spotify</h3>
+            <p class="text-sm text-secondary">Paste a Spotify playlist or track link. Each song will be searched on YouTube and added to the queue.</p>
+            <input
+                class="yt-input"
+                type="text"
+                placeholder="https://open.spotify.com/playlist/... or /track/..."
+                bind:value={spotifyUrl}
+                disabled={spotifyLoading}
+                on:keydown={(e) => e.key === 'Enter' && submitSpotifyUrl()}
+            />
+            {#if spotifyStatus}
+                <p class="text-sm {spotifyStatus.startsWith('Error') ? 'text-error' : 'text-secondary'}">
+                    {#if spotifyLoading}<Spinner size={14} />{/if}
+                    {spotifyStatus}
+                </p>
+            {/if}
+            <div class="flex gap-2 justify-end">
+                <button class="btn btn-secondary" on:click={closeSpotifyInput} disabled={spotifyLoading}>Cancel</button>
+                <button class="btn btn-primary" on:click={submitSpotifyUrl} disabled={spotifyLoading || !spotifyUrl.trim()}>
+                    {spotifyLoading ? 'Importing...' : 'Import'}
+                </button>
+            </div>
+        </div>
+    </div>
+{/if}
+
 <style>
+    /* ── Add menu dropdown ─────────────────────────────────────────── */
+    .add-menu-wrapper {
+        position: relative;
+    }
+
+    .add-menu {
+        position: absolute;
+        right: 0;
+        top: 100%;
+        margin-top: 0.25rem;
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        overflow: hidden;
+        z-index: 20;
+        min-width: 130px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    }
+
+    .add-menu-item {
+        display: block;
+        width: 100%;
+        padding: 0.5rem 0.75rem;
+        background: none;
+        border: none;
+        color: var(--text-primary);
+        font-size: 0.8rem;
+        text-align: left;
+        cursor: pointer;
+        transition: background var(--transition-fast);
+    }
+
+    .add-menu-item:hover {
+        background: var(--bg-subtle);
+    }
+
+    /* ── YouTube overlay ───────────────────────────────────────────── */
+    .yt-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.6);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+    }
+
+    .yt-modal {
+        width: 480px;
+        max-width: 90vw;
+    }
+
+    .yt-input {
+        width: 100%;
+        padding: 0.625rem 0.75rem;
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        color: var(--text-primary);
+        font-size: 0.875rem;
+    }
+
+    .yt-input:focus {
+        outline: none;
+        border-color: var(--accent-green);
+    }
+
+    .yt-input:disabled {
+        opacity: 0.5;
+    }
+
+    .text-error {
+        color: #ef4444;
+    }
+
+    /* ── Existing styles ───────────────────────────────────────────── */
     .shuffle-btn {
         color: white;
         font-size: 1rem;

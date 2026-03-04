@@ -11,6 +11,7 @@ mod queue;
 mod session;
 mod sync;
 mod transfer;
+mod youtube;
 
 use commands::AppState;
 
@@ -78,6 +79,10 @@ pub fn run() {
             commands::queue::remove_from_queue,
             commands::queue::reorder_queue,
             commands::queue::shuffle_queue,
+            commands::queue::add_youtube_song,
+            commands::queue::enqueue_youtube,
+            commands::queue::search_youtube,
+            commands::queue::import_spotify,
             commands::requests::request_song,
             commands::requests::accept_song_request,
             commands::requests::reject_song_request,

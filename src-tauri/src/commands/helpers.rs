@@ -251,7 +251,7 @@ pub(super) async fn backfill_decoded_cache(app: &AppHandle, state: &AppState) {
         tokio::spawn(async move {
             log::info!("[cache] Backfill: decoding {file_id}...");
             match tokio::task::spawn_blocking(move || {
-                let decoded = crate::audio::decoder::decode_mp3(&bytes)?;
+                let decoded = crate::audio::decoder::decode_audio(&bytes)?;
                 if let Some(dev_rate) = target_rate {
                     if decoded.sample_rate != dev_rate {
                         log::info!(

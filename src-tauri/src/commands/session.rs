@@ -94,6 +94,30 @@ pub async fn create_session(
 
             // Spawn a task to forward SessionEvents → Tauri events.
             let app_clone = app.clone();
+
+            // Spawn the YouTube background workers.
+            {
+                let meta_app = app.clone();
+                let meta_handle = tokio::spawn(async move {
+                    youtube_metadata_worker(meta_app).await;
+                });
+
+                let dl_app = app.clone();
+                let dl_handle = tokio::spawn(async move {
+                    youtube_download_worker(dl_app).await;
+                });
+
+                let search_app = app.clone();
+                let search_handle = tokio::spawn(async move {
+                    youtube_search_worker(search_app).await;
+                });
+
+                *state.download_worker.lock().await = Some(dl_handle);
+                *state.metadata_worker.lock().await = Some(meta_handle);
+                *state.search_worker.lock().await = Some(search_handle);
+                log::info!("[create_session] YouTube search + metadata + download workers started");
+            }
+
             tokio::spawn(async move {
                 while let Some(event) = event_rx.recv().await {
                     match event {
@@ -243,14 +267,14 @@ pub async fn create_session(
                                             tokio::spawn(async move {
                                                 let s = app_for_upload.state::<AppState>();
 
-                                                // Validate MP3 by decoding.
+                                                // Validate audio by decoding.
                                                 let file_data_clone = file_data.clone();
                                                 let decoded = match tokio::task::spawn_blocking(move || {
-                                                    crate::audio::decoder::decode_mp3(&file_data_clone)
+                                                    crate::audio::decoder::decode_audio(&file_data_clone)
                                                 }).await {
                                                     Ok(Ok(d)) => d,
                                                     Ok(Err(e)) => {
-                                                        log::error!("[host] Uploaded file is not a valid MP3: {e}");
+                                                        log::error!("[host] Uploaded file is not valid audio: {e}");
                                                         return;
                                                     }
                                                     Err(e) => {
@@ -745,10 +769,10 @@ pub async fn join_session(
                                                         let s = app_for_catchup.state::<AppState>();
                                                         log::info!("[peer] Catch-up (bg): decoding {} bytes for {file_id}...", file_bytes.len());
                                                         let decoded = match tokio::task::spawn_blocking(move || {
-                                                            crate::audio::decoder::decode_mp3(&file_bytes)
+                                                            crate::audio::decoder::decode_audio(&file_bytes)
                                                         }).await {
                                                             Ok(Ok(d)) => d,
-                                                            Ok(Err(e)) => { log::error!("[peer] Catch-up (bg): failed to decode MP3: {e}"); return; }
+                                                            Ok(Err(e)) => { log::error!("[peer] Catch-up (bg): failed to decode audio: {e}"); return; }
                                                             Err(e) => { log::error!("[peer] Catch-up (bg): decode task failed: {e}"); return; }
                                                         };
 
@@ -938,7 +962,7 @@ pub async fn join_session(
                                                     tokio::spawn(async move {
                                                         log::info!("[peer] Pre-decoding \"{fname}\" ({fid})...");
                                                         match tokio::task::spawn_blocking(move || {
-                                                            let decoded = crate::audio::decoder::decode_mp3(&bytes)?;
+                                                            let decoded = crate::audio::decoder::decode_audio(&bytes)?;
                                                             // If we know the device sample rate and it differs,
                                                             // resample now so load_track is instant later.
                                                             if let Some(dev_rate) = target_rate {
@@ -1065,10 +1089,10 @@ pub async fn join_session(
                                                 let s = app_for_play.state::<AppState>();
                                                 log::info!("[peer] PlayCommand (bg): decoding {} bytes for {file_id}...", file_bytes.len());
                                                 let decoded = match tokio::task::spawn_blocking(move || {
-                                                    crate::audio::decoder::decode_mp3(&file_bytes)
+                                                    crate::audio::decoder::decode_audio(&file_bytes)
                                                 }).await {
                                                     Ok(Ok(d)) => d,
-                                                    Ok(Err(e)) => { log::error!("Peer (bg): failed to decode MP3: {e}"); return; }
+                                                    Ok(Err(e)) => { log::error!("Peer (bg): failed to decode audio: {e}"); return; }
                                                     Err(e) => { log::error!("Peer (bg): decode task failed: {e}"); return; }
                                                 };
 
@@ -1289,7 +1313,7 @@ pub async fn join_session(
                                                         tokio::spawn(async move {
                                                             log::info!("[peer] Pre-decoding own upload {request_id}...");
                                                             match tokio::task::spawn_blocking(move || {
-                                                                let decoded = crate::audio::decoder::decode_mp3(&file_data)?;
+                                                                let decoded = crate::audio::decoder::decode_audio(&file_data)?;
                                                                 if let Some(dev_rate) = target_rate {
                                                                     if decoded.sample_rate != dev_rate {
                                                                         log::info!(
@@ -1465,6 +1489,157 @@ pub async fn join_session(
     }
 }
 
+// ── YouTube background workers ──────────────────────────────────────────────
+
+/// Background task that polls for search queries, runs `ytsearch1:<query>`,
+/// and enqueues the resulting URL into the download queue.  Runs every 500ms.
+async fn youtube_search_worker(app: AppHandle) {
+    use super::queue::emit_download_queue;
+
+    log::info!("[yt_search] Search worker started");
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let state = app.state::<AppState>();
+
+        {
+            let session = state.session.lock().await;
+            if !session.is_active() {
+                log::info!("[yt_search] Session ended — stopping worker");
+                break;
+            }
+        }
+
+        let task = match state.search_queue.take_next().await {
+            Some(t) => t,
+            None => continue,
+        };
+
+        log::info!("[yt_search] Searching for \"{}\" (task #{}, download #{})", task.query, task.id, task.download_task_id);
+
+        match crate::youtube::download::search_youtube(&task.query).await {
+            Ok(url) => {
+                log::info!("[yt_search] Found: {} for \"{}\"", url, task.query);
+                // Resolve the existing download task with the found URL.
+                state.download_queue.resolve_search(task.download_task_id, url).await;
+                let snapshot = state.download_queue.snapshot().await;
+                emit_download_queue(&app, &snapshot);
+            }
+            Err(e) => {
+                log::error!("[yt_search] Search failed for \"{}\": {e}", task.query);
+                // Mark the download task as failed so user sees the error.
+                state.download_queue.mark_failed(
+                    task.download_task_id,
+                    format!("Search failed: {e}"),
+                ).await;
+                let snapshot = state.download_queue.snapshot().await;
+                emit_download_queue(&app, &snapshot);
+            }
+        }
+    }
+}
+
+/// Background task that polls for newly-enqueued tasks (Pending) and fetches
+/// their metadata from yt-dlp.  Runs every 500ms.
+async fn youtube_metadata_worker(app: AppHandle) {
+    use super::queue::emit_download_queue;
+
+    log::info!("[yt_meta] Metadata worker started");
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let state = app.state::<AppState>();
+
+        // Stop if session is gone.
+        {
+            let session = state.session.lock().await;
+            if !session.is_active() {
+                log::info!("[yt_meta] Session ended — stopping worker");
+                break;
+            }
+        }
+
+        let task = match state.download_queue.take_next_pending().await {
+            Some(t) => t,
+            None => continue,
+        };
+
+        log::info!("[yt_meta] Fetching metadata for task #{} ({})", task.id, task.url);
+
+        // Emit updated queue (task now shows as "fetchingMeta").
+        let snapshot = state.download_queue.snapshot().await;
+        emit_download_queue(&app, &snapshot);
+
+        match crate::youtube::download::fetch_metadata(&task.url).await {
+            Ok(meta) => {
+                log::info!("[yt_meta] Task #{} → \"{}\" by \"{}\"", task.id, meta.title, meta.artist);
+                state.download_queue.resolve_metadata(task.id, meta.title, meta.artist).await;
+            }
+            Err(e) => {
+                log::error!("[yt_meta] Task #{} metadata failed: {e}", task.id);
+                state.download_queue.mark_failed(task.id, e).await;
+            }
+        }
+
+        let snapshot = state.download_queue.snapshot().await;
+        emit_download_queue(&app, &snapshot);
+    }
+}
+
+/// Background task that polls for tasks with resolved metadata (Queued) and
+/// downloads / decodes / adds them to the playback queue one at a time.
+async fn youtube_download_worker(app: AppHandle) {
+    use super::queue::{emit_download_queue, process_youtube_download};
+
+    log::info!("[yt_worker] Download worker started");
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let state = app.state::<AppState>();
+
+        // Check if session is still active.
+        {
+            let session = state.session.lock().await;
+            if !session.is_active() {
+                log::info!("[yt_worker] Session ended — stopping worker");
+                break;
+            }
+        }
+
+        // Try to take the next queued (metadata-resolved) task.
+        let task = match state.download_queue.take_next_queued().await {
+            Some(t) => t,
+            None => continue,
+        };
+
+        log::info!("[yt_worker] Processing task #{}: \"{}\" by \"{}\"", task.id, task.title, task.artist);
+
+        // Emit updated queue (task now shows as "downloading").
+        let snapshot = state.download_queue.snapshot().await;
+        emit_download_queue(&app, &snapshot);
+
+        // Process the download.
+        match process_youtube_download(&app, &task.url, &task.title, &task.artist).await {
+            Ok(()) => {
+                log::info!("[yt_worker] Task #{} completed successfully", task.id);
+                // Remove completed task from download queue.
+                state.download_queue.remove(task.id).await;
+            }
+            Err(e) => {
+                log::error!("[yt_worker] Task #{} failed: {e}", task.id);
+                state.download_queue.mark_failed(task.id, e).await;
+            }
+        }
+
+        // Emit updated queue.
+        let snapshot = state.download_queue.snapshot().await;
+        emit_download_queue(&app, &snapshot);
+    }
+}
+
 #[tauri::command]
 pub async fn leave_session(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
@@ -1484,6 +1659,18 @@ pub async fn leave_session(app: AppHandle) -> Result<(), String> {
     if let Some(h) = state.latency_ticker.lock().await.take() {
         h.abort();
     }
+    // Stop the YouTube workers.
+    if let Some(h) = state.download_worker.lock().await.take() {
+        h.abort();
+    }
+    if let Some(h) = state.metadata_worker.lock().await.take() {
+        h.abort();
+    }
+    if let Some(h) = state.search_worker.lock().await.take() {
+        h.abort();
+    }
+    state.download_queue.clear().await;
+    state.search_queue.clear().await;
     stop_position_ticker(&state).await;
     {
         let audio = state.audio_output.lock().await;

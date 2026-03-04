@@ -17,6 +17,7 @@ use crate::session::Session;
 use crate::transfer::file_cache::FileCache;
 use crate::transfer::file_transfer::{FileReceiver, FileTransferManager};
 use crate::transfer::song_request::SongRequestManager;
+use crate::youtube::queue::{DownloadQueue, SearchQueue};
 use parking_lot::Mutex as ParkingMutex;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -179,6 +180,16 @@ pub struct AppState {
     pub peer_current_file_id: ParkingMutex<Option<Uuid>>,
     /// Peer-side: maps file_name → file_path for pending song requests awaiting host accept.
     pub pending_request_paths: ParkingMutex<HashMap<String, String>>,
+    /// YouTube download task queue — processed by a background worker.
+    pub download_queue: DownloadQueue,
+    /// Handle to the YouTube download worker task (aborted on session leave).
+    pub download_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Handle to the YouTube metadata worker task (aborted on session leave).
+    pub metadata_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// YouTube search task queue — processed by the search worker.
+    pub search_queue: SearchQueue,
+    /// Handle to the YouTube search worker task (aborted on session leave).
+    pub search_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -203,6 +214,11 @@ impl AppState {
             latency_ticker: Mutex::new(None),
             peer_current_file_id: ParkingMutex::new(None),
             pending_request_paths: ParkingMutex::new(HashMap::new()),
+            download_queue: DownloadQueue::new(),
+            download_worker: Mutex::new(None),
+            metadata_worker: Mutex::new(None),
+            search_queue: SearchQueue::new(),
+            search_worker: Mutex::new(None),
         }
     }
 }
