@@ -27,6 +27,8 @@
     let ytdlpBanner = '';
 
     onMount(async () => {
+        window.addEventListener('keydown', handleKeydown);
+
         unlisteners.push(
             await listen<PeerInfo>(EVENTS.PEER_JOINED, (e) => {
                 peersStore.update(peers => {
@@ -74,8 +76,29 @@
     });
 
     onDestroy(() => {
+        window.removeEventListener('keydown', handleKeydown);
         unlisteners.forEach(fn => fn());
     });
+
+    function handleKeydown(e: KeyboardEvent) {
+        // Ignore when the user is typing in an input or textarea.
+        const tag = (e.target as HTMLElement)?.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+        if (e.code === 'Space') {
+            e.preventDefault();
+            togglePlay();
+        }
+    }
+
+    async function togglePlay() {
+        try {
+            if ($playbackStore.state === 'playing') {
+                await invoke('pause');
+            } else {
+                await invoke('play');
+            }
+        } catch { /* ignore */ }
+    }
 
     async function endSession() {
         if (!confirmingEnd) {

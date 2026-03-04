@@ -163,6 +163,39 @@
     }
 
     // ── Add Song source picker ──────────────────────────────────────────
+    // ── Right-click context menu ─────────────────────────────────────
+    let ctxMenu = { show: false, x: 0, y: 0, trackId: '', realIndex: -1 };
+
+    function openCtxMenu(e: MouseEvent, trackId: string, realIndex: number) {
+        e.preventDefault();
+        ctxMenu = { show: true, x: e.clientX, y: e.clientY, trackId, realIndex };
+    }
+
+    function closeCtxMenu() {
+        ctxMenu = { ...ctxMenu, show: false };
+    }
+
+    async function playNext() {
+        const fromIndex = ctxMenu.realIndex;
+        // Find the currently-playing track's real index in the full queue.
+        const playingIdx = $queueStore.findIndex(q => q.status === 'Playing');
+        // Target position: right after the playing track, or top of queue.
+        const toIndex = playingIdx >= 0 ? playingIdx + 1 : 0;
+        closeCtxMenu();
+        if (fromIndex === toIndex || fromIndex === toIndex - 1) return; // already there
+        try {
+            await invoke('reorder_queue', { fromIndex, toIndex });
+        } catch (e) {
+            console.error('Failed to move track:', e);
+        }
+    }
+
+    function ctxRemove() {
+        const id = ctxMenu.trackId;
+        closeCtxMenu();
+        removeSong(id);
+    }
+
     let showAddMenu = false;
     let showYoutubeInput = false;
     let youtubeUrl = '';
@@ -299,6 +332,7 @@
                     on:drop={(e) => handleDrop(e, i, realIndex)}
                     on:dragend={handleDragEnd}
                     on:dblclick={() => handleDoubleClick(item.id)}
+                    on:contextmenu={(e) => editable && openCtxMenu(e, item.id, realIndex)}
                     role={editable ? 'listitem' : undefined}
                 >
                     <!-- Drag handle -->
@@ -351,6 +385,23 @@
         </div>
     {/if}
 </div>
+
+<!-- Right-click context menu -->
+{#if ctxMenu.show}
+    <!-- svelte-ignore a11y-click-events-have-key-events -->
+    <div class="ctx-backdrop" on:click={closeCtxMenu} role="presentation">
+        <div
+            class="ctx-menu"
+            style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;"
+            on:click|stopPropagation
+            role="menu"
+            tabindex="-1"
+        >
+            <button class="ctx-menu-item" on:click={playNext} role="menuitem">▶ Play next</button>
+            <button class="ctx-menu-item ctx-menu-danger" on:click={ctxRemove} role="menuitem">✕ Remove from queue</button>
+        </div>
+    </div>
+{/if}
 
 <!-- YouTube URL input overlay -->
 {#if showYoutubeInput}
@@ -497,6 +548,46 @@
         color: #ef4444;
     }
 
+    /* ── Context menu ──────────────────────────────────────────────── */
+    .ctx-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 50;
+    }
+
+    .ctx-menu {
+        position: fixed;
+        background: var(--bg-elevated);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        overflow: hidden;
+        z-index: 51;
+        min-width: 160px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+
+    .ctx-menu-item {
+        display: block;
+        width: 100%;
+        padding: 0.5rem 0.75rem;
+        background: none;
+        border: none;
+        color: var(--text-primary);
+        font-size: 0.8rem;
+        text-align: left;
+        cursor: pointer;
+        transition: background var(--transition-fast);
+    }
+
+    .ctx-menu-item:hover {
+        background: var(--bg-subtle);
+    }
+
+    .ctx-menu-danger:hover {
+        background: rgba(239, 68, 68, 0.15);
+        color: #ef4444;
+    }
+
     /* ── Existing styles ───────────────────────────────────────────── */
     .shuffle-btn {
         color: white;
@@ -519,7 +610,8 @@
     }
 
     .queue-list {
-        max-height: calc(100vh - 280px);
+        flex: 1;
+        min-height: 0;
     }
 
     .queue-item {
