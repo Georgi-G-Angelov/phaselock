@@ -13,6 +13,9 @@
     /** Whether to show the Request Song button (peer only). */
     export let showRequestButton: boolean = false;
 
+    /** Whether yt-dlp is ready (blocks YouTube / Spotify). */
+    export let ytdlpReady: boolean = true;
+
     // Filter out played songs but remember each item's real backend index.
     type VisibleItem = { item: QueueItem; realIndex: number };
     $: visibleQueue = $queueStore
@@ -260,8 +263,8 @@
                     {#if showAddMenu}
                         <div class="add-menu">
                             <button class="add-menu-item" on:click={pickFiles}>📁 Files</button>
-                            <button class="add-menu-item" on:click={openYoutubeInput}>▶ YouTube</button>
-                            <button class="add-menu-item" on:click={openSpotifyInput}>🎧 Spotify</button>
+                            <button class="add-menu-item" on:click={openYoutubeInput} disabled={!ytdlpReady}>▶ YouTube {!ytdlpReady ? '(loading…)' : ''}</button>
+                            <button class="add-menu-item" on:click={openSpotifyInput} disabled={!ytdlpReady}>🎧 Spotify {!ytdlpReady ? '(loading…)' : ''}</button>
                         </div>
                     {/if}
                 </div>
@@ -444,6 +447,15 @@
 
     .add-menu-item:hover {
         background: var(--bg-subtle);
+    }
+
+    .add-menu-item:disabled {
+        opacity: 0.4;
+        cursor: default;
+    }
+
+    .add-menu-item:disabled:hover {
+        background: none;
     }
 
     /* ── YouTube overlay ───────────────────────────────────────────── */

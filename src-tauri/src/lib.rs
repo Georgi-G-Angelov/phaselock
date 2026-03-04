@@ -33,6 +33,13 @@ pub fn run() {
         .manage(AppState::new())
         .setup(|app| {
             commands::setup_auto_advance_listener(app.handle());
+
+            // Fire-and-forget: update yt-dlp in the background via pip.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                youtube::update_ytdlp(handle).await;
+            });
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -83,6 +90,7 @@ pub fn run() {
             commands::queue::enqueue_youtube,
             commands::queue::search_youtube,
             commands::queue::import_spotify,
+            commands::queue::get_ytdlp_status,
             commands::requests::request_song,
             commands::requests::accept_song_request,
             commands::requests::reject_song_request,

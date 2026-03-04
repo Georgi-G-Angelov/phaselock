@@ -23,6 +23,8 @@
     let unlisteners: UnlistenFn[] = [];
     let searchQuery = '';
     let searchPending = false;
+    let ytdlpReady = false;
+    let ytdlpBanner = '';
 
     onMount(async () => {
         unlisteners.push(
@@ -55,7 +57,20 @@
             await listen<ErrorEvent>(EVENTS.ERROR_GENERAL, (e) => {
                 toast?.show(e.payload.message, 'error');
             }),
+            await listen<{ state: string; message: string }>(EVENTS.YTDLP_STATUS, (e) => {
+                const s = e.payload.state;
+                ytdlpReady = s === 'ready';
+                ytdlpBanner = (s === 'ready') ? '' : e.payload.message;
+            }),
         );
+
+        // The status event may have fired before this component mounted.
+        // Query the current status so we don't stay stuck on "loading".
+        try {
+            const status = await invoke<{ state: string; message: string }>('get_ytdlp_status');
+            ytdlpReady = status.state === 'ready';
+            ytdlpBanner = (status.state === 'ready') ? '' : status.message;
+        } catch (_) { /* ignore */ }
     });
 
     onDestroy(() => {
@@ -115,15 +130,15 @@
             <input
                 class="search-input"
                 type="text"
-                placeholder="Search YouTube..."
+                placeholder={ytdlpReady ? 'Search YouTube...' : 'yt-dlp loading…'}
                 bind:value={searchQuery}
                 on:keydown={handleSearchKeydown}
-                disabled={searchPending}
+                disabled={searchPending || !ytdlpReady}
             />
             <button
                 class="search-btn"
                 on:click|stopPropagation={handleSearch}
-                disabled={searchPending || !searchQuery.trim()}
+                disabled={searchPending || !searchQuery.trim() || !ytdlpReady}
                 aria-label="Search"
             >⏎</button>
         </div>
@@ -138,6 +153,13 @@
         </div>
     </header>
 
+    {#if ytdlpBanner}
+        <div class="ytdlp-banner flex items-center gap-2 px-4 py-2">
+            <span class="spinner-inline"></span>
+            <span class="text-sm">{ytdlpBanner}</span>
+        </div>
+    {/if}
+
     <div class="session-body flex flex-1">
         <aside class="panel-left flex-col p-4">
             <PeerList />
@@ -148,7 +170,7 @@
             <SongRequests />
         </div>
         <aside class="panel-right flex-col p-4 overflow-y-auto">
-            <Queue editable={true} on:toast-message={(e) => toast?.show(e.detail.message, e.detail.variant)} />
+            <Queue editable={true} ytdlpReady={ytdlpReady} on:toast-message={(e) => toast?.show(e.detail.message, e.detail.variant)} />
         </aside>
     </div>
 </div>
@@ -239,5 +261,25 @@
     .search-btn:disabled {
         opacity: 0.4;
         cursor: default;
+    }
+
+    .ytdlp-banner {
+        background: var(--bg-elevated);
+        border-bottom: 1px solid var(--border-subtle);
+        color: var(--text-secondary);
+        flex-shrink: 0;
+    }
+
+    .spinner-inline {
+        width: 14px;
+        height: 14px;
+        border: 2px solid var(--border-subtle);
+        border-top-color: var(--accent-green);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+        to { transform: rotate(360deg); }
     }
 </style>

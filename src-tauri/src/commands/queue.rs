@@ -286,6 +286,12 @@ pub async fn enqueue_youtube(app: AppHandle, url: String) -> Result<(), String> 
     Ok(())
 }
 
+/// Tauri command: return the current yt-dlp readiness status.
+#[tauri::command]
+pub fn get_ytdlp_status() -> Result<crate::youtube::YtDlpStatus, String> {
+    Ok(crate::youtube::current_status())
+}
+
 /// Tauri command: instantly enqueue a YouTube search query for background processing.
 #[tauri::command]
 pub async fn search_youtube(app: AppHandle, query: String) -> Result<(), String> {

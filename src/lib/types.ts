@@ -139,4 +139,7 @@ export const EVENTS = {
 
   // YouTube download queue
   YOUTUBE_DOWNLOAD_QUEUE: 'youtube:download-queue',
+
+  // yt-dlp status
+  YTDLP_STATUS: 'ytdlp:status',
 } as const;
