@@ -20,6 +20,10 @@ pub struct PendingRequest {
     pub peer_name: String,
     pub file_name: String,
     pub file_size: u64,
+    /// "file" | "youtube_url" | "youtube_search" | "spotify_track"
+    pub kind: String,
+    /// Human-readable song name (resolved by peer before sending).
+    pub display_name: String,
 }
 
 /// An in-progress upload from a peer to the host.
@@ -96,8 +100,11 @@ impl SongRequestManager {
         peer_name: String,
         file_name: String,
         file_size: u64,
+        kind: String,
+        display_name: String,
     ) -> Result<PendingRequest, AutoRejectReason> {
-        if file_size > MAX_FILE_SIZE {
+        // Only enforce size limit for file uploads.
+        if kind == "file" && file_size > MAX_FILE_SIZE {
             log::warn!(
                 "Auto-rejecting song request from peer {peer_id}: file too large ({file_size} bytes)"
             );
@@ -111,6 +118,8 @@ impl SongRequestManager {
             peer_name,
             file_name,
             file_size,
+            kind,
+            display_name,
         };
 
         log::info!(
@@ -139,19 +148,22 @@ impl SongRequestManager {
             .position(|r| r.request_id == request_id)?;
         let req = self.pending_requests.remove(pos);
 
-        log::info!("Accepted song request {request_id} from peer {}", req.peer_id);
+        log::info!("Accepted song request {request_id} (kind={}) from peer {}", req.kind, req.peer_id);
 
-        self.active_uploads.insert(
-            request_id,
-            IncomingUpload {
+        // Only set up file upload tracking for file-type requests.
+        if req.kind == "file" {
+            self.active_uploads.insert(
                 request_id,
-                file_name: req.file_name.clone(),
-                peer_id: req.peer_id,
-                expected_size: req.file_size,
-                data: vec![0u8; req.file_size as usize],
-                bytes_received: 0,
-            },
-        );
+                IncomingUpload {
+                    request_id,
+                    file_name: req.file_name.clone(),
+                    peer_id: req.peer_id,
+                    expected_size: req.file_size,
+                    data: vec![0u8; req.file_size as usize],
+                    bytes_received: 0,
+                },
+            );
+        }
 
         Some(req)
     }

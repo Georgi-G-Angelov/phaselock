@@ -20,8 +20,9 @@ pub enum Message {
     FileReceived { file_id: Uuid, hash_ok: bool },
 
     // Song requests
-    SongRequest { file_name: String, file_size: u64 },
-    SongRequestAccepted { request_id: Uuid, file_name: String },
+    /// kind: "file" | "youtube_url" | "youtube_search" | "spotify_track"
+    SongRequest { file_name: String, file_size: u64, kind: String, display_name: String },
+    SongRequestAccepted { request_id: Uuid, file_name: String, kind: String },
     SongRequestRejected { request_id: Uuid },
     SongUploadChunk { request_id: Uuid, offset: u64, data: Vec<u8> },
     SongUploadComplete { request_id: Uuid, sha256: [u8; 32] },

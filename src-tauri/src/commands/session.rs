@@ -201,8 +201,8 @@ pub async fn create_session(
                                         log::info!("Peer {peer_id} already has all files");
                                     }
                                 }
-                                Message::SongRequest { file_name, file_size } => {
-                                    log::info!("[host] Received SongRequest from peer {peer_id}: \"{file_name}\" ({file_size} bytes)");
+                                Message::SongRequest { file_name, file_size, kind, display_name } => {
+                                    log::info!("[host] Received SongRequest (kind={kind}) from peer {peer_id}: \"{display_name}\" ({file_size} bytes)");
                                     let s = app_clone.state::<AppState>();
 
                                     // Look up peer display name.
@@ -219,7 +219,7 @@ pub async fn create_session(
                                     };
 
                                     let mut requests = s.song_requests.lock().await;
-                                    match requests.receive_request(peer_id, peer_name.clone(), file_name.clone(), file_size) {
+                                    match requests.receive_request(peer_id, peer_name.clone(), file_name.clone(), file_size, kind.clone(), display_name.clone()) {
                                         Ok(pending) => {
                                             #[derive(Clone, serde::Serialize)]
                                             struct SongRequestIncoming {
@@ -227,6 +227,8 @@ pub async fn create_session(
                                                 peer_name: String,
                                                 file_name: String,
                                                 file_size: u64,
+                                                kind: String,
+                                                display_name: String,
                                             }
                                             let _ = app_clone.emit(
                                                 "request:incoming",
@@ -235,6 +237,8 @@ pub async fn create_session(
                                                     peer_name,
                                                     file_name,
                                                     file_size,
+                                                    kind,
+                                                    display_name,
                                                 },
                                             );
                                         }
@@ -1248,8 +1252,15 @@ pub async fn join_session(
                                         );
                                     }
                                 }
-                                Message::SongRequestAccepted { request_id, file_name } => {
-                                    log::info!("[peer] Song request {request_id} accepted — uploading \"{file_name}\"");
+                                Message::SongRequestAccepted { request_id, file_name, kind } => {
+                                    log::info!("[peer] Song request {request_id} accepted (kind={kind}) — \"{file_name}\"");
+
+                                    // For non-file requests the host processes everything; nothing to upload.
+                                    if kind != "file" {
+                                        log::info!("[peer] Non-file request ({kind}) accepted — no upload needed");
+                                        continue;
+                                    }
+
                                     let s = app_clone.state::<AppState>();
 
                                     // Look up the local file path we stored when sending the request.

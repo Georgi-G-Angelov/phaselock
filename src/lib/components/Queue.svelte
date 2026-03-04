@@ -25,8 +25,42 @@
     const dispatch = createEventDispatcher<{ 'toast-message': { message: string; variant: 'success' | 'error' | 'info' } }>();
 
     let requestPending = false;
+    let requestStatus = '';
+    let showRequestMenu = false;
+    let showRequestYtInput = false;
+    let showRequestSearchInput = false;
+    let showRequestSpotifyInput = false;
+    let requestYtUrl = '';
+    let requestSearchQuery = '';
+    let requestSpotifyUrl = '';
 
-    async function requestSong() {
+    interface ResolvedMeta { display_name: string; content: string; }
+
+    /** Resolve metadata, then send the request. */
+    async function resolveAndRequest(kind: string, content: string) {
+        requestPending = true;
+        requestStatus = 'Resolving…';
+        try {
+            const meta = await invoke<ResolvedMeta>('resolve_song_meta', { kind, content });
+            requestStatus = 'Sending…';
+            await invoke('request_song', { kind, content: meta.content, displayName: meta.display_name });
+            dispatch('toast-message', { message: `Requested: ${meta.display_name}`, variant: 'success' });
+            return true;
+        } catch (e) {
+            dispatch('toast-message', { message: `Request failed: ${e}`, variant: 'error' });
+            return false;
+        } finally {
+            requestPending = false;
+            requestStatus = '';
+        }
+    }
+
+    function toggleRequestMenu() {
+        showRequestMenu = !showRequestMenu;
+    }
+
+    async function requestFile() {
+        showRequestMenu = false;
         const selected = await open({
             multiple: true,
             filters: [{ name: 'Audio', extensions: ['mp3'] }],
@@ -36,7 +70,8 @@
             requestPending = true;
             try {
                 for (const filePath of paths) {
-                    await invoke('request_song', { filePath });
+                    const meta = await invoke<ResolvedMeta>('resolve_song_meta', { kind: 'file', content: filePath });
+                    await invoke('request_song', { kind: 'file', content: filePath, displayName: meta.display_name });
                 }
                 dispatch('toast-message', {
                     message: paths.length === 1 ? 'Song request sent!' : `${paths.length} song requests sent!`,
@@ -48,6 +83,27 @@
                 requestPending = false;
             }
         }
+    }
+
+    async function requestYoutube() {
+        const url = requestYtUrl.trim();
+        if (!url) return;
+        const ok = await resolveAndRequest('youtube_url', url);
+        if (ok) { showRequestYtInput = false; requestYtUrl = ''; }
+    }
+
+    async function requestSearch() {
+        const query = requestSearchQuery.trim();
+        if (!query) return;
+        const ok = await resolveAndRequest('youtube_search', query);
+        if (ok) { showRequestSearchInput = false; requestSearchQuery = ''; }
+    }
+
+    async function requestSpotify() {
+        const url = requestSpotifyUrl.trim();
+        if (!url) return;
+        const ok = await resolveAndRequest('spotify_track', url);
+        if (ok) { showRequestSpotifyInput = false; requestSpotifyUrl = ''; }
     }
 
     let dragIndex: number | null = null;
@@ -374,14 +430,53 @@
 
     {#if showRequestButton}
         <div class="request-section" style="margin-top: auto; padding-top: 0.75rem; border-top: 1px solid var(--border-subtle);">
-            <button
-                class="btn btn-primary"
-                style="width: 100%;"
-                on:click={requestSong}
-                disabled={requestPending}
-            >
-                {requestPending ? 'Request pending...' : '🎵 Request Song'}
-            </button>
+            {#if showRequestYtInput}
+                <div class="request-inline flex-col gap-2">
+                    <input class="yt-input" type="text" placeholder="YouTube URL..." bind:value={requestYtUrl}
+                        disabled={requestPending} on:keydown={(e) => e.key === 'Enter' && requestYoutube()} />
+                    <div class="flex gap-2">
+                        <button class="btn btn-secondary btn-sm flex-1" on:click={() => { showRequestYtInput = false; requestYtUrl = ''; }}>Cancel</button>
+                        <button class="btn btn-primary btn-sm flex-1" on:click={requestYoutube} disabled={requestPending || !requestYtUrl.trim()}>Send</button>
+                    </div>
+                </div>
+            {:else if showRequestSearchInput}
+                <div class="request-inline flex-col gap-2">
+                    <input class="yt-input" type="text" placeholder="Search YouTube..." bind:value={requestSearchQuery}
+                        disabled={requestPending} on:keydown={(e) => e.key === 'Enter' && requestSearch()} />
+                    <div class="flex gap-2">
+                        <button class="btn btn-secondary btn-sm flex-1" on:click={() => { showRequestSearchInput = false; requestSearchQuery = ''; }}>Cancel</button>
+                        <button class="btn btn-primary btn-sm flex-1" on:click={requestSearch} disabled={requestPending || !requestSearchQuery.trim()}>Send</button>
+                    </div>
+                </div>
+            {:else if showRequestSpotifyInput}
+                <div class="request-inline flex-col gap-2">
+                    <input class="yt-input" type="text" placeholder="Spotify track URL..." bind:value={requestSpotifyUrl}
+                        disabled={requestPending} on:keydown={(e) => e.key === 'Enter' && requestSpotify()} />
+                    <div class="flex gap-2">
+                        <button class="btn btn-secondary btn-sm flex-1" on:click={() => { showRequestSpotifyInput = false; requestSpotifyUrl = ''; }}>Cancel</button>
+                        <button class="btn btn-primary btn-sm flex-1" on:click={requestSpotify} disabled={requestPending || !requestSpotifyUrl.trim()}>Send</button>
+                    </div>
+                </div>
+            {:else}
+                <div class="add-menu-wrapper" style="width: 100%;">
+                    <button
+                        class="btn btn-primary"
+                        style="width: 100%;"
+                        on:click={toggleRequestMenu}
+                        disabled={requestPending}
+                    >
+                        {requestPending ? (requestStatus || 'Sending…') : '🎵 Request Song'}
+                    </button>
+                    {#if showRequestMenu}
+                        <div class="add-menu" style="bottom: 100%; top: auto; margin-bottom: 0.25rem; margin-top: 0;">
+                            <button class="add-menu-item" on:click={requestFile}>📁 File</button>
+                            <button class="add-menu-item" on:click={() => { showRequestMenu = false; showRequestYtInput = true; }}>▶ YouTube URL</button>
+                            <button class="add-menu-item" on:click={() => { showRequestMenu = false; showRequestSearchInput = true; }}>🔍 YouTube Search</button>
+                            <button class="add-menu-item" on:click={() => { showRequestMenu = false; showRequestSpotifyInput = true; }}>🎧 Spotify Track</button>
+                        </div>
+                    {/if}
+                </div>
+            {/if}
         </div>
     {/if}
 </div>

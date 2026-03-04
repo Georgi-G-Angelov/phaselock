@@ -49,6 +49,10 @@ export interface SongRequest {
   peer_name: string;
   file_name: string;
   file_size: number;
+  /** "file" | "youtube_url" | "youtube_search" | "spotify_track" */
+  kind: string;
+  /** Human-readable song name (resolved by peer before sending). */
+  display_name: string;
 }
 
 export interface TransferProgress {

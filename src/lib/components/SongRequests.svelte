@@ -70,11 +70,19 @@
             {#each $songRequests as request (request.request_id)}
                 <div class="request-card card-elevated flex-col gap-2">
                     <div class="flex-col gap-1">
-                        <span class="text-sm text-ellipsis">{request.file_name}</span>
+                        <span class="text-sm text-ellipsis">
+                            {#if request.kind === 'youtube_url'}▶ {request.display_name || request.file_name}
+                            {:else if request.kind === 'youtube_search'}🔍 {request.display_name || request.file_name}
+                            {:else if request.kind === 'spotify_track'}🎧 {request.display_name || request.file_name}
+                            {:else}{request.display_name || request.file_name}
+                            {/if}
+                        </span>
                         <div class="flex items-center gap-2">
                             <span class="text-xs text-secondary">from {request.peer_name}</span>
-                            {#if request.file_size}
+                            {#if request.kind === 'file' && request.file_size}
                                 <span class="text-xs text-secondary">· {formatFileSize(request.file_size)}</span>
+                            {:else if request.kind && request.kind !== 'file'}
+                                <span class="text-xs text-secondary">· {request.kind === 'youtube_url' ? 'YouTube' : request.kind === 'youtube_search' ? 'Search' : request.kind === 'spotify_track' ? 'Spotify' : request.kind}</span>
                             {/if}
                         </div>
                     </div>

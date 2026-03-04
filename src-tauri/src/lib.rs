@@ -94,6 +94,7 @@ pub fn run() {
             commands::requests::request_song,
             commands::requests::accept_song_request,
             commands::requests::reject_song_request,
+            commands::requests::resolve_song_meta,
             commands::playback::set_volume,
         ])
         .run(tauri::generate_context!())
